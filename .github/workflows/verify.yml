@@ -31,6 +31,9 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p reports
+          # pipefail is not on by default: without it bash would report tee's exit
+          # code and a failing gate would look green.
+          set -o pipefail
           python verify.py --report reports/fast.json --log reports/fast.log 2>&1 | tee reports/fast.stdout.log
       - name: upload fast report
         if: always()

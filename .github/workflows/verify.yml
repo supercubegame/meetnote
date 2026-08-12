@@ -99,7 +99,71 @@ jobs:
           path: reports/
           if-no-files-found: warn
           retention-days: 14
+      - name: leave an external heartbeat
+        # Why this step exists: GitHub silently disables scheduled workflows after
+        # 60 days of repository inactivity, and a disabled cron leaves this file
+        # completely untouched. So "the cron is still declared in the YAML" is an
+        # empty assertion for the exact failure it appears to guard, and nothing
+        # inside CI can catch it either: the guard would have to run on the cron
+        # that already stopped running.
+        # A dated heartbeat committed by the run itself is a positive trace that
+        # can only exist if the run really happened. Something outside the repo
+        # compares checked_at against today; stale means the daily drift check is
+        # dead, however green the repo looks. Runs on always() so an outage or a
+        # drift still proves the schedule is alive.
+        if: always() && github.event_name == 'schedule'
+        env:
+          LIVE_CODE: ${{ steps.gate.outputs.code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import datetime, json, os
+
+          code = os.environ.get("LIVE_CODE") or ""
+          status = {"0": "ok", "1": "drift", "78": "unconfirmed"}.get(code, "unknown")
+          report = {}
+          try:
+              with open("reports/live.json", encoding="utf-8") as fh:
+                  report = json.load(fh)
+          except Exception:
+              pass
+          evidence = report.get("evidence") or {}
+          payload = {
+              "checked_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "trigger": "schedule",
+              "exit_code": code,
+              "status": status,
+              "checks_passed": report.get("checks_passed"),
+              "checks_run": report.get("checks_run"),
+              "response_id": evidence.get("response_id"),
+              "attempted_request": evidence.get("attempted_request"),
+              "run_url": os.environ["RUN_URL"],
+              "note": "Written only by the daily scheduled run. If checked_at is more than ~48h old, the cron is not running, whatever the repo looks like.",
+          }
+          with open(".github/live-heartbeat.json", "w", encoding="utf-8") as fh:
+              fh.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/live-heartbeat.json
+          # [skip ci] is load bearing. This commit lands on main, a push to main
+          # runs the live gate, and that would write another heartbeat, forever,
+          # at one real API call per lap.
+          git commit -m "chore: daily live gate heartbeat [skip ci]"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "heartbeat landed on attempt $attempt"
+              exit 0
+            fi
+            echo "push failed; rebasing on main and retrying"
+            git pull --rebase origin main
+          done
+          echo "the heartbeat never landed. an outside auditor would read a stale file and cannot tell that apart from a dead cron, so this is fatal"
+          exit 1
       - name: classify live outcome
+        if: always()
         run: |
           code="${{ steps.gate.outputs.code }}"
           echo "live gate exit code: $code"
@@ -220,6 +284,11 @@ jobs:
                 for (const c of bad) { L.push('- `' + c.id + '`: ' + c.detail); }
                 L.push('</details>');
               }
+            }
+
+            if (isSchedule) {
+              L.push('');
+              L.push('心跳已写回 `.github/live-heartbeat.json`,外部审计靠它的时间戳判断这条定时任务还活着。');
             }
 
             const body = L.join('\n');

@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import unittest
+import uuid
 from datetime import date
 
 from meetnote import client as client_mod
@@ -21,9 +22,11 @@ from meetnote import live_check
 ROOT = str(pathlib.Path(__file__).resolve().parents[1])
 TODAY = date(2026, 8, 12)
 NONCE = "probe-abc123def456"
-# Long enough for the redactor and the repo scan to take it seriously, and it is
-# deliberately not a string that appears anywhere in the repository.
-KEY = "sk-live-0000000000000000000000000000"
+
+# Generated per run, never written down. A literal here would be found by the
+# gate's own key_absent_from_repo scan: that already happened once and turned six
+# unrelated tests red, which is a nice proof that the scan is not decorative.
+KEY = "sk-live-" + uuid.uuid4().hex
 
 
 def content_for(nonce):
@@ -185,7 +188,7 @@ class Red(unittest.TestCase):
             else:
                 os.environ["MEETNOTE_STUB_FILE"] = previous
         self.assertEqual(report["status"], "drift")
-        self.assertEqual(len(report["drift"]), 1)
+        self.assertEqual(len(report["drift"]), 1, report["drift"])
         self.assertIn("stub_channel_absent", report["drift"][0])
 
     def test_emptied_contract_is_red(self):

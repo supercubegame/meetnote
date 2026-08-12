@@ -5,4 +5,4 @@ number stays stale, and nobody notices. Adding or removing a test is meant to be
 loud, so bump this number in the same commit.
 """
 
-EXPECTED_CHECKS = 94
+EXPECTED_CHECKS = 96

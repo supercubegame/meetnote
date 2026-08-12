@@ -179,6 +179,11 @@ class Workflow(unittest.TestCase):
     These are pattern matches over YAML, so each one first proves it actually
     parsed a non-empty region. A scan that silently matches nothing is the same
     thing as an assertion that is always true.
+
+    The floors below are per region, not one blanket number: a flat 300 chars
+    already failed once on a perfectly correct trigger block that is only 273
+    chars long. Each floor is roughly a third of the real size, so it catches
+    "matched nothing" without tripping on normal edits.
     """
 
     def _text(self):
@@ -186,10 +191,15 @@ class Workflow(unittest.TestCase):
         self.assertGreater(len(text), 1000)
         return text
 
-    def _region(self, text, start, end=None):
+    def _region(self, text, start, end=None, min_len=300):
         begin = text.index(start)
         region = text[begin : text.index(end)] if end else text[begin:]
-        self.assertGreater(len(region), 300, "region %r looks empty; the scan is not working" % start)
+        self.assertGreater(
+            len(region),
+            min_len,
+            "region %r is %d chars, under the %d floor; the scan is probably matching "
+            "the wrong thing" % (start, len(region), min_len),
+        )
         return region
 
     def _report_job(self, text):
@@ -235,7 +245,8 @@ class Workflow(unittest.TestCase):
         """Response drift is time driven. Upstream can change the envelope on a day
         nobody pushes anything, so a push-only trigger cannot see it."""
         text = self._text()
-        triggers = self._region(text, "\non:", "\npermissions:")
+        # The trigger block is short by nature: ~270 chars, so the floor is 90.
+        triggers = self._region(text, "\non:", "\npermissions:", min_len=90)
         self.assertIn("schedule:", triggers)
         self.assertIn("cron:", triggers)
         self.assertIn("workflow_dispatch:", triggers)

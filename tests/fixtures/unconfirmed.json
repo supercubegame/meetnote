@@ -1,0 +1,26 @@
+{
+  "note": "Envelope is fine, content is thin: no owner, an unparseable due date, a blank decision. Everything must survive into the result, flagged.",
+  "responses": [
+    {
+      "status": 200,
+      "body_json": {
+        "id": "fixture-unconfirmed-001",
+        "model": "step-3.7-flash",
+        "choices": [
+          {
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+              "role": "assistant",
+              "content": "{\"participants\": [{\"name\": \"陈迪\", \"role\": null}], \"decisions\": [\"下一版本先做导入\", \"\"], \"action_items\": [{\"task\": \"补字段映射文档\", \"owner\": null, \"due_date\": \"尽快\"}, {\"task\": \"压测导入接口\", \"owner\": \"林岚\", \"due_date\": \"2026-02-30\"}]}"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 401,
+          "completion_tokens": 96
+        }
+      }
+    }
+  ]
+}

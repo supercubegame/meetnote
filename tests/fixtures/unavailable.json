@@ -1,0 +1,9 @@
+{
+  "note": "Always 503. StubTransport repeats the last step, so this exercises the full retry ladder.",
+  "responses": [
+    {
+      "status": 503,
+      "body": "{\"error\": {\"message\": \"upstream temporarily unavailable\", \"type\": \"server_error\"}}"
+    }
+  ]
+}

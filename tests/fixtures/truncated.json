@@ -1,0 +1,26 @@
+{
+  "note": "finish_reason=length. The result must be marked unconfirmed rather than read as a clean pass.",
+  "responses": [
+    {
+      "status": 200,
+      "body_json": {
+        "id": "fixture-truncated-001",
+        "model": "step-3.7-flash",
+        "choices": [
+          {
+            "index": 0,
+            "finish_reason": "length",
+            "message": {
+              "role": "assistant",
+              "content": "{\"participants\": [{\"name\": \"陈迪\", \"role\": \"产品\"}], \"decisions\": [\"先做导入\"], \"action_items\": [{\"task\": \"补文档\", \"owner\": \"陈迪\", \"due_date\": \"8月20日\"}]}"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 402,
+          "completion_tokens": 512
+        }
+      }
+    }
+  ]
+}

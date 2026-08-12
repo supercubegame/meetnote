@@ -1,0 +1,28 @@
+{
+  "note": "Recorded happy path. Fixture ids carry the fixture- prefix so the live gate can prove a real response is not one of these.",
+  "responses": [
+    {
+      "status": 200,
+      "body_json": {
+        "id": "fixture-ok-001",
+        "object": "chat.completion",
+        "created": 1786000000,
+        "model": "step-3.7-flash",
+        "choices": [
+          {
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+              "role": "assistant",
+              "content": "{\"participants\": [{\"name\": \"陈迪\", \"role\": \"产品\"}, {\"name\": \"林岚\", \"role\": \"后端\"}], \"decisions\": [\"下一版本先做导入，不做导出\"], \"action_items\": [{\"task\": \"补一份 CSV 字段映射文档\", \"owner\": \"陈迪\", \"due_date\": \"8月20日\"}, {\"task\": \"压测导入接口\", \"owner\": \"林岚\", \"due_date\": \"下周五\"}]}"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 412,
+          "completion_tokens": 188
+        }
+      }
+    }
+  ]
+}

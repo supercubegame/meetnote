@@ -1,0 +1,12 @@
+{
+  "attempted_request": null,
+  "checked_at": null,
+  "checks_passed": null,
+  "checks_run": null,
+  "exit_code": null,
+  "note": "Seed value. Only the daily scheduled live-gate run overwrites this file, so checked_at == null means the cron has never reported yet. Do not hand-edit: a hand-written timestamp here would forge the one signal that proves the schedule is alive.",
+  "response_id": null,
+  "run_url": null,
+  "status": "bootstrap",
+  "trigger": null
+}

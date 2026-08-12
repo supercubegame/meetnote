@@ -23,6 +23,7 @@ MODULES = (
     "tests.test_core",
     "tests.test_client",
     "tests.test_cli_e2e",
+    "tests.test_live_gate",
     "tests.test_meta",
 )
 

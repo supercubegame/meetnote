@@ -17,6 +17,10 @@ Two outcomes are deliberately kept apart:
                          measuring reality is worse than no gate.
 
 Additive envelope changes (new keys we do not read) are reported, not fatal.
+
+tests/test_live_gate.py drives every one of these branches offline with an
+injected transport, so each outcome is known to be reachable. A drift detector
+that has never been observed failing is indistinguishable from a decoration.
 """
 from __future__ import annotations
 
@@ -40,6 +44,8 @@ FIXTURE_GLOB = "tests/fixtures/*.json"
 # Frozen by equality in test_meta. Emptying this set would make the live gate
 # pass for free, so the fast gate refuses to let that happen quietly.
 EXPECTED_CONTRACT_PATH_COUNT = 7
+
+KNOWN_TOP_LEVEL_KEYS = {"id", "model", "choices", "usage", "object", "created"}
 
 PROBE_NOTES = (
     "会议纪要（自动化探针 {nonce}）\n"
@@ -111,7 +117,7 @@ def scan_repo_for(value, root="."):
     hits = []
     if not value or len(value) < 8:
         return hits
-    skip_dirs = {".git", "__pycache__", "reports", ".github/cache"}
+    skip_dirs = {".git", "__pycache__", "reports", "incoming", ".venv"}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for name in filenames:
@@ -125,7 +131,17 @@ def scan_repo_for(value, root="."):
     return hits
 
 
-def run_live(*, api_key, root=".", transport=None, today=None, nonce=None, endpoint=core.ENDPOINT):
+def run_live(
+    *,
+    api_key,
+    root=".",
+    transport=None,
+    today=None,
+    nonce=None,
+    endpoint=core.ENDPOINT,
+    clock=None,
+    retry_budget=None,
+):
     report = Report()
     today = today or date.today()
     nonce = nonce or ("probe-" + uuid.uuid4().hex[:12])
@@ -142,7 +158,8 @@ def run_live(*, api_key, root=".", transport=None, today=None, nonce=None, endpo
     report.check(
         "contract_not_emptied",
         len(core.REQUIRED_RESPONSE_PATHS) == EXPECTED_CONTRACT_PATH_COUNT,
-        "expected %d required paths, found %d" % (EXPECTED_CONTRACT_PATH_COUNT, len(core.REQUIRED_RESPONSE_PATHS)),
+        "expected %d required paths, found %d"
+        % (EXPECTED_CONTRACT_PATH_COUNT, len(core.REQUIRED_RESPONSE_PATHS)),
     )
     report.check(
         "endpoint_is_real",
@@ -156,17 +173,24 @@ def run_live(*, api_key, root=".", transport=None, today=None, nonce=None, endpo
         return report.as_dict()
 
     transport = transport or client_mod.UrllibTransport(timeout=90)
+    report.evidence["transport"] = type(transport).__name__
     report.check(
         "transport_is_real",
-        type(transport).__name__ == "UrllibTransport",
-        "transport=%s" % type(transport).__name__,
+        isinstance(transport, client_mod.UrllibTransport),
+        "transport=%s is not a real http transport" % type(transport).__name__,
     )
 
     leaks = scan_repo_for(api_key, root)
     report.check("key_absent_from_repo", not leaks, "key found in: %s" % ",".join(leaks))
 
     payload = core.build_request(PROBE_NOTES.format(nonce=nonce, today=today.isoformat()), today=today)
-    api = client_mod.Client(transport, api_key, endpoint=endpoint)
+    api = client_mod.Client(
+        transport,
+        api_key,
+        endpoint=endpoint,
+        clock=clock,
+        retry_budget=retry_budget,
+    )
     report.evidence["attempted_request"] = True
 
     started = time.monotonic()
@@ -218,8 +242,7 @@ def run_live(*, api_key, root=".", transport=None, today=None, nonce=None, endpo
     )
 
     if isinstance(envelope, dict):
-        known_top = {"id", "model", "choices", "usage", "object", "created"}
-        additions = sorted(k for k in envelope if k not in known_top)
+        additions = sorted(k for k in envelope if k not in KNOWN_TOP_LEVEL_KEYS)
         report.evidence["envelope_additions"] = additions
         if additions:
             report.checks.append(
@@ -247,22 +270,19 @@ def run_live(*, api_key, root=".", transport=None, today=None, nonce=None, endpo
     # Liveness proof from the semantic side. Soft on purpose: a model is allowed
     # to paraphrase, and turning this red would make the gate flaky. Reported
     # loudly instead, and it cannot be satisfied by any recording.
-    echoed = nonce in content
     report.check(
         "nonce_echoed_by_model",
-        echoed,
+        nonce in content,
         "probe nonce %s absent from model output; structural drift checks are still authoritative" % nonce,
         fatal=False,
     )
 
-    extracted = result["counts"]["participants"] > 0 and result["counts"]["action_items"] > 0
     report.check(
         "probe_yielded_extractions",
-        extracted,
+        result["counts"]["participants"] > 0 and result["counts"]["action_items"] > 0,
         "probe has 2 participants and 2 action items but got %s" % result["counts"],
         fatal=False,
     )
 
-    dues = [item["due_date"] for item in result["action_items"]]
-    report.evidence["due_dates"] = dues
+    report.evidence["due_dates"] = [item["due_date"] for item in result["action_items"]]
     return report.as_dict()

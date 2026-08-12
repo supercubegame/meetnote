@@ -8,7 +8,6 @@ and the CI writeback paths.
 import ast
 import glob
 import json
-import os
 import pathlib
 import unittest
 
@@ -20,7 +19,13 @@ from tests.expected_counts import EXPECTED_CHECKS
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CORE = ROOT / "meetnote" / "core.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "verify.yml"
-TEST_FILES = ("test_core.py", "test_client.py", "test_cli_e2e.py", "test_meta.py")
+TEST_FILES = (
+    "test_core.py",
+    "test_client.py",
+    "test_cli_e2e.py",
+    "test_live_gate.py",
+    "test_meta.py",
+)
 
 BANNED_ATTR_CALLS = {"now", "today", "monotonic", "time", "random", "uuid4", "getenv", "system", "popen"}
 BANNED_NAME_CALLS = {"print", "open", "input", "eval", "exec"}
@@ -181,8 +186,7 @@ class Workflow(unittest.TestCase):
         return region
 
     def test_workflow_has_both_writeback_paths(self):
-        text = self._text()
-        region = self._report_job(text)
+        region = self._report_job(self._text())
         self.assertIn("meetnote-verify-report", region)
         for needle in (
             "issues.createComment",
@@ -206,6 +210,18 @@ class Workflow(unittest.TestCase):
         self.assertIn("steps.writeback.outcome != 'success'", region)
         self.assertIn('"$code" = "78"', text)
         self.assertIn("not a pass", text)
+
+    def test_fast_gate_pipeline_cannot_mask_failures(self):
+        text = self._text()
+        fast = text[text.index("\n  fast:") : text.index("\n  live:")]
+        self.assertGreater(len(fast), 300)
+        if "| tee" in fast:
+            self.assertIn(
+                "set -o pipefail",
+                fast,
+                "piping the gate through tee without pipefail reports tee's exit code, "
+                "so a failing gate would look green",
+            )
 
 
 if __name__ == "__main__":

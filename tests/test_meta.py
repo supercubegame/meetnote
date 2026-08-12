@@ -3,7 +3,7 @@
 A rule that only lives in AGENTS.md is advice. A rule with an assertion is a
 rule. Everything here exists because it would otherwise rot quietly: the purity
 of the core, the frozen response contract, the doc length limit, the check count,
-and the CI writeback paths.
+and the CI trigger policy and writeback paths.
 """
 import ast
 import glob
@@ -174,16 +174,26 @@ class CheckCount(unittest.TestCase):
 
 
 class Workflow(unittest.TestCase):
+    """Static checks over the CI definition.
+
+    These are pattern matches over YAML, so every one of them first proves it
+    actually parsed a non-empty region. A scan that silently matches nothing is
+    the same thing as an assertion that is always true.
+    """
+
     def _text(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertGreater(len(text), 1000)
         return text
 
-    def _report_job(self, text):
-        start = text.index("\n  report:")
-        region = text[start:]
-        self.assertGreater(len(region), 500, "report job region looks empty; the scan is not working")
+    def _region(self, text, start, end=None):
+        begin = text.index(start)
+        region = text[begin : text.index(end)] if end else text[begin:]
+        self.assertGreater(len(region), 300, "region %r looks empty; the scan is not working" % start)
         return region
+
+    def _report_job(self, text):
+        return self._region(text, "\n  report:")
 
     def test_workflow_has_both_writeback_paths(self):
         region = self._report_job(self._text())
@@ -213,8 +223,7 @@ class Workflow(unittest.TestCase):
 
     def test_fast_gate_pipeline_cannot_mask_failures(self):
         text = self._text()
-        fast = text[text.index("\n  fast:") : text.index("\n  live:")]
-        self.assertGreater(len(fast), 300)
+        fast = self._region(text, "\n  fast:", "\n  live:")
         if "| tee" in fast:
             self.assertIn(
                 "set -o pipefail",
@@ -222,6 +231,58 @@ class Workflow(unittest.TestCase):
                 "piping the gate through tee without pipefail reports tee's exit code, "
                 "so a failing gate would look green",
             )
+
+    def test_live_gate_is_also_driven_by_a_clock(self):
+        """Response drift is time driven. Upstream can change the envelope on a day
+        nobody pushes anything, so a push-only trigger cannot see it."""
+        text = self._text()
+        triggers = self._region(text, "\non:", "\npermissions:")
+        self.assertIn("schedule:", triggers)
+        self.assertIn("cron:", triggers)
+        self.assertIn("workflow_dispatch:", triggers)
+        live = self._region(text, "\n  live:", "\n  report:")
+        self.assertIn("github.event_name == 'schedule'", live)
+
+    def test_live_gate_runs_on_pull_requests_and_main(self):
+        live = self._region(self._text(), "\n  live:", "\n  report:")
+        condition = live[live.index("if: >-") : live.index("runs-on:")]
+        self.assertGreater(len(condition), 100)
+        self.assertIn("github.event_name == 'pull_request'", condition)
+        self.assertIn("refs/heads/main", condition)
+        self.assertIn("github.event_name == 'workflow_dispatch'", condition)
+
+    def test_a_skipped_live_gate_is_only_ok_when_predicted(self):
+        """The one failure mode that hides itself: if the live job's condition stops
+        matching the documented policy, it silently never runs and every run stays
+        green. So the verdict compares the job result against an independently
+        computed expectation and fails on any mismatch, in either direction."""
+        region = self._report_job(self._text())
+        expect = region[region.index("id: expect") : region.index("write back report")]
+        self.assertGreater(len(expect), 200)
+        self.assertIn("pull_request|schedule|workflow_dispatch", expect)
+        self.assertIn("refs/heads/main", expect)
+        verdict = region[region.index("name: verdict") :]
+        self.assertGreater(len(verdict), 300)
+        self.assertIn('expected="${{ steps.expect.outputs.live }}"', verdict)
+        self.assertIn('[ "$live" != "skipped" ]', verdict)
+        self.assertIn("no longer matches the docs", verdict)
+
+    def test_scheduled_drift_is_escalated_somewhere_a_human_looks(self):
+        """A scheduled run has no PR, and its commit comment lands on a main SHA
+        that may not have moved in a week. Nobody reads that."""
+        region = self._report_job(self._text())
+        self.assertIn("meetnote-live-contract-alert", region)
+        self.assertIn("await github.rest.issues.create({", region)
+        self.assertIn("await github.rest.issues.update({", region)
+        self.assertIn("state: 'open'", region)
+        self.assertIn("state: 'closed'", region)
+
+    def test_report_says_out_loud_when_drift_was_not_checked(self):
+        """Omitting the live section on feature branches would let a green comment
+        read as though the real contract had been verified. It was not."""
+        region = self._report_job(self._text())
+        self.assertIn("liveExpected", region)
+        self.assertIn("没有被验证", region)
 
 
 if __name__ == "__main__":

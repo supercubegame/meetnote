@@ -27,6 +27,10 @@ TEST_FILES = (
     "test_meta.py",
 )
 
+# The one path an outside auditor is told to read. Pinned here so it cannot move
+# without the docs moving with it.
+HEARTBEAT_PATH = ".github/live-heartbeat.json"
+
 BANNED_ATTR_CALLS = {"now", "today", "monotonic", "time", "random", "uuid4", "getenv", "system", "popen"}
 BANNED_NAME_CALLS = {"print", "open", "input", "eval", "exec"}
 
@@ -120,6 +124,17 @@ class Docs(unittest.TestCase):
         self.assertGreater(len(lines), 20)
         self.assertLessEqual(len(lines), 200, "AGENTS.md 超过 200 行，模型会开始忽略里面的指令")
 
+    def test_heartbeat_path_is_documented(self):
+        """An outside auditor is told to read this exact path every week. If the path
+        moves and the docs do not, that audit reads nothing and reports healthy,
+        which is the same failure shape it was added to cover."""
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn(HEARTBEAT_PATH, agents)
+        self.assertTrue((ROOT / HEARTBEAT_PATH).exists(), "%s is missing" % HEARTBEAT_PATH)
+        seed = json.loads((ROOT / HEARTBEAT_PATH).read_text(encoding="utf-8"))
+        self.assertIn("checked_at", seed)
+        self.assertIn("status", seed)
+
 
 class Fixtures(unittest.TestCase):
     def _fixture_paths(self):
@@ -205,6 +220,9 @@ class Workflow(unittest.TestCase):
     def _report_job(self, text):
         return self._region(text, "\n  report:")
 
+    def _live_job(self, text):
+        return self._region(text, "\n  live:", "\n  report:")
+
     def test_workflow_has_both_writeback_paths(self):
         region = self._report_job(self._text())
         self.assertIn("meetnote-verify-report", region)
@@ -250,11 +268,10 @@ class Workflow(unittest.TestCase):
         self.assertIn("schedule:", triggers)
         self.assertIn("cron:", triggers)
         self.assertIn("workflow_dispatch:", triggers)
-        live = self._region(text, "\n  live:", "\n  report:")
-        self.assertIn("github.event_name == 'schedule'", live)
+        self.assertIn("github.event_name == 'schedule'", self._live_job(text))
 
     def test_live_gate_runs_on_pull_requests_and_main(self):
-        live = self._region(self._text(), "\n  live:", "\n  report:")
+        live = self._live_job(self._text())
         condition = live[live.index("if: >-") : live.index("runs-on:")]
         self.assertGreater(len(condition), 100)
         self.assertIn("github.event_name == 'pull_request'", condition)
@@ -311,6 +328,43 @@ class Workflow(unittest.TestCase):
             "resolving a PR from the commit puts the push run back in charge of the "
             "PR comment, which is exactly the clobber this rule prevents",
         )
+
+    def test_scheduled_run_leaves_an_external_heartbeat(self):
+        """GitHub auto-disables schedules after 60 days of repo inactivity, and a
+        disabled cron leaves this YAML untouched. So asserting "the cron is still
+        declared" would stay true through the exact failure it appears to guard,
+        and no internal guard can help: it would have to run on the dead cron.
+
+        The only thing that survives that is a dated trace the run itself leaves
+        behind, readable from outside the repo. This checks the trace gets written
+        on every scheduled run (always(), so an outage or a drift still proves the
+        schedule is alive) and that a failure to deliver it is fatal.
+        """
+        live = self._live_job(self._text())
+        heartbeat = live[live.index("leave an external heartbeat") : live.index("classify live outcome")]
+        self.assertGreater(len(heartbeat), 800, "heartbeat step region looks wrong")
+        self.assertIn(HEARTBEAT_PATH, heartbeat)
+        self.assertIn("if: always() && github.event_name == 'schedule'", heartbeat)
+        self.assertIn("checked_at", heartbeat)
+        self.assertIn("git push origin HEAD:main", heartbeat)
+        self.assertNotIn(
+            "continue-on-error",
+            heartbeat,
+            "an undelivered heartbeat reads exactly like a dead cron, so it must fail the job",
+        )
+        self.assertIn("exit 1", heartbeat, "the retry loop must end in a real failure")
+
+    def test_heartbeat_commit_cannot_retrigger_ci(self):
+        """The heartbeat lands on main, and a push to main runs the live gate, which
+        writes another heartbeat. Without a skip marker that is an infinite loop
+        that also burns one real API call per lap."""
+        heartbeat_commit = [
+            line
+            for line in self._live_job(self._text()).splitlines()
+            if "git commit" in line and "heartbeat" in line
+        ]
+        self.assertEqual(len(heartbeat_commit), 1, "expected exactly one heartbeat commit line")
+        self.assertIn("skip ci", heartbeat_commit[0])
 
 
 if __name__ == "__main__":

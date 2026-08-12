@@ -3,7 +3,7 @@
 A rule that only lives in AGENTS.md is advice. A rule with an assertion is a
 rule. Everything here exists because it would otherwise rot quietly: the purity
 of the core, the frozen response contract, the doc length limit, the check count,
-and the CI writeback paths.
+and the CI trigger policy and writeback paths.
 """
 import ast
 import glob
@@ -174,16 +174,36 @@ class CheckCount(unittest.TestCase):
 
 
 class Workflow(unittest.TestCase):
+    """Static checks over the CI definition.
+
+    These are pattern matches over YAML, so each one first proves it actually
+    parsed a non-empty region. A scan that silently matches nothing is the same
+    thing as an assertion that is always true.
+
+    The floors below are per region, not one blanket number: a flat 300 chars
+    already failed once on a perfectly correct trigger block that is only 273
+    chars long. Each floor is roughly a third of the real size, so it catches
+    "matched nothing" without tripping on normal edits.
+    """
+
     def _text(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertGreater(len(text), 1000)
         return text
 
-    def _report_job(self, text):
-        start = text.index("\n  report:")
-        region = text[start:]
-        self.assertGreater(len(region), 500, "report job region looks empty; the scan is not working")
+    def _region(self, text, start, end=None, min_len=300):
+        begin = text.index(start)
+        region = text[begin : text.index(end)] if end else text[begin:]
+        self.assertGreater(
+            len(region),
+            min_len,
+            "region %r is %d chars, under the %d floor; the scan is probably matching "
+            "the wrong thing" % (start, len(region), min_len),
+        )
         return region
+
+    def _report_job(self, text):
+        return self._region(text, "\n  report:")
 
     def test_workflow_has_both_writeback_paths(self):
         region = self._report_job(self._text())
@@ -191,7 +211,6 @@ class Workflow(unittest.TestCase):
         for needle in (
             "issues.createComment",
             "issues.updateComment",
-            "listPullRequestsAssociatedWithCommit",
             "createCommitComment",
             "updateCommitComment",
         ):
@@ -213,8 +232,7 @@ class Workflow(unittest.TestCase):
 
     def test_fast_gate_pipeline_cannot_mask_failures(self):
         text = self._text()
-        fast = text[text.index("\n  fast:") : text.index("\n  live:")]
-        self.assertGreater(len(fast), 300)
+        fast = self._region(text, "\n  fast:", "\n  live:")
         if "| tee" in fast:
             self.assertIn(
                 "set -o pipefail",
@@ -222,6 +240,77 @@ class Workflow(unittest.TestCase):
                 "piping the gate through tee without pipefail reports tee's exit code, "
                 "so a failing gate would look green",
             )
+
+    def test_live_gate_is_also_driven_by_a_clock(self):
+        """Response drift is time driven. Upstream can change the envelope on a day
+        nobody pushes anything, so a push-only trigger cannot see it."""
+        text = self._text()
+        # The trigger block is short by nature: ~270 chars, so the floor is 90.
+        triggers = self._region(text, "\non:", "\npermissions:", min_len=90)
+        self.assertIn("schedule:", triggers)
+        self.assertIn("cron:", triggers)
+        self.assertIn("workflow_dispatch:", triggers)
+        live = self._region(text, "\n  live:", "\n  report:")
+        self.assertIn("github.event_name == 'schedule'", live)
+
+    def test_live_gate_runs_on_pull_requests_and_main(self):
+        live = self._region(self._text(), "\n  live:", "\n  report:")
+        condition = live[live.index("if: >-") : live.index("runs-on:")]
+        self.assertGreater(len(condition), 100)
+        self.assertIn("github.event_name == 'pull_request'", condition)
+        self.assertIn("refs/heads/main", condition)
+        self.assertIn("github.event_name == 'workflow_dispatch'", condition)
+
+    def test_a_skipped_live_gate_is_only_ok_when_predicted(self):
+        """The one failure mode that hides itself: if the live job's condition stops
+        matching the documented policy it silently never runs, and every run stays
+        green forever. So the verdict compares the job result against an
+        independently computed expectation and fails on a mismatch either way."""
+        region = self._report_job(self._text())
+        expect = region[region.index("id: expect") : region.index("write back report")]
+        self.assertGreater(len(expect), 200)
+        self.assertIn("pull_request|schedule|workflow_dispatch", expect)
+        self.assertIn("refs/heads/main", expect)
+        verdict = region[region.index("name: verdict") :]
+        self.assertGreater(len(verdict), 300)
+        self.assertIn('expected="${{ steps.expect.outputs.live }}"', verdict)
+        self.assertIn('[ "$live" != "skipped" ]', verdict)
+        self.assertIn("no longer matches the docs", verdict)
+
+    def test_scheduled_drift_is_escalated_somewhere_a_human_looks(self):
+        """A scheduled run has no PR, and its commit comment lands on a main SHA
+        that may not have moved in a week. Nobody reads that."""
+        region = self._report_job(self._text())
+        self.assertIn("meetnote-live-contract-alert", region)
+        self.assertIn("await github.rest.issues.create({", region)
+        self.assertIn("await github.rest.issues.update({", region)
+        self.assertIn("state: 'open'", region)
+        self.assertIn("state: 'closed'", region)
+
+    def test_report_says_out_loud_when_drift_was_not_checked(self):
+        """Omitting the live section on feature branches would let a green comment
+        read as though the real contract had been verified. It was not."""
+        region = self._report_job(self._text())
+        self.assertIn("liveExpected", region)
+        self.assertIn("没有被验证", region)
+
+    def test_push_runs_cannot_clobber_the_pr_report(self):
+        """One destination, one owner. A push to a branch with an open PR fires both
+        a push run and a pull_request run for the same commit; the push run skips
+        the live gate, so if it also owned the PR comment it could land second and
+        overwrite the full report with "live gate did not run"."""
+        region = self._report_job(self._text())
+        self.assertIn("ANTI-CLOBBER", region)
+        self.assertIn(
+            "const issueNumber = context.payload.pull_request ? context.payload.pull_request.number : null;",
+            region,
+        )
+        self.assertNotIn(
+            "listPullRequestsAssociatedWithCommit",
+            region,
+            "resolving a PR from the commit puts the push run back in charge of the "
+            "PR comment, which is exactly the clobber this rule prevents",
+        )
 
 
 if __name__ == "__main__":

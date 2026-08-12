@@ -37,6 +37,7 @@ MEETNOTE_STUB_FILE=tests/fixtures/ok.json python -m meetnote.cli parse - --today
    唯一上线的位置是 `Client.build_headers()`。真实的泄漏路径是**接口把我们的 Authorization
    头回显在错误体里**,所以所有出口都过 `Redactor`，并且有一条端到端断言用随机哨兵值验证
    四个出口（stdout / stderr / 日志文件 / 落盘文件）都是 0 次出现。
+   测试里也不许写死 key 形状的字面量,慢闸门的仓库扫描会抓到它，这事已经发生过一次。
 4. **「接口挂了」和「接口变了」是两件事，永远不能合并。**
    - 5xx / 429 / 连接错误 / 401 / 403 → `AvailabilityError`,我们什么都没学到，标未确认，可重试。
    - 拒绝我们请求形状的 4xx，或者 2xx 但响应体不符合 `REQUIRED_RESPONSE_PATHS` → `ContractError`,必须红。
@@ -61,6 +62,8 @@ MEETNOTE_STUB_FILE=tests/fixtures/ok.json python -m meetnote.cli parse - --today
   在守。默认值：500 / 2 / 5 / 8000，等待序列 500-1000-2000-4000-8000。
   用 `--retry-budget` 调小时上限会变得碰不到，这是显式选择，不是默认路径。
 - `--backoff-scale` 只用来让离线闸门别真等 15 秒。产品默认值不许为了迁就测试时长而改。
+- 慢闸门的触发条件（job 的 `if:`）和 report job 里 `id: expect` 那段算「该不该跑」的逻辑
+  是一组：**改一个必须同时改另一个**，对不上 verdict 会红。这是故意的，见下。
 
 ## 慢闸门为什么必须存在
 
@@ -70,7 +73,7 @@ MEETNOTE_STUB_FILE=tests/fixtures/ok.json python -m meetnote.cli parse - --today
 为了防止慢闸门退化成「验证我们自己的录音」，它带一组回放守卫，任何一条不成立直接判红：
 
 - `stub_channel_absent`：`MEETNOTE_STUB_FILE` 一旦被设置立刻红。
-- `transport_is_real`：transport 必须是 `UrllibTransport`。
+- `transport_is_real`：transport 必须是真的 `UrllibTransport`，不能是录音回放器。
 - `endpoint_is_real`：必须打 `core.ENDPOINT` 且是 https。
 - `contract_not_emptied`：必须真有 7 条待校验路径,先证明「解析到了东西」，再断言里面有什么。
 - `response_is_not_a_recording`：真实响应 id 不能带 `fixture-` 前缀，也不能撞上任何录音 id。
@@ -86,6 +89,9 @@ MEETNOTE_STUB_FILE=tests/fixtures/ok.json python -m meetnote.cli parse - --today
 
 **新增字段只报告不判红**（`envelope_additions`），加字段是正常演进；少字段和改类型才是漂移。
 
+`tests/test_live_gate.py` 用注入的 transport 离线走遍上面每一个分支。理由：一条从没被看见
+失败过的断言，和一条不可能失败的断言，从外面看长得一模一样。
+
 ## 这些是真的测不出来的，别去补那个补不上的洞
 
 - 模型语义质量。它把「下周五」理解成哪天，我们能验；它有没有漏掉一条决议，机器判不了。
@@ -94,19 +100,41 @@ MEETNOTE_STUB_FILE=tests/fixtures/ok.json python -m meetnote.cli parse - --today
 - `elapsed_ms` 只是证据，不是断言。CI 机器很快，在这里设阈值就是装饰。
 - 「接口挂了」和「接口在维护窗口返回了合法但空的响应」在可观测层面可以完全一致。
   我们能断言的是行为本身：触发了兜底、标了未确认。
+- **GitHub 会在仓库 60 天无活动后自动停用定时工作流。** 一旦停用，每日漂移检查会静默消失，
+  而仓库看起来一切正常。这个洞**没法从仓库内部断言**,任何守卫都得靠那条已经不跑的定时任务
+  去执行。只能靠人：仓库进入低活跃期时，去 Actions 页面确认定时任务还在跑。
 
 ## CI 与报告
 
-两个并行 job（`fast` 离线 / `live` 打真实接口），第三个 `report` job 把两份报告合并写回评论。
+三个 job：`fast`（离线，每次推送都跑）·`live`（打真实接口）·`report`（合并两份报告写回评论）。
 
-- 有 PR 时写 PR 评论，没 PR 时写 commit 评论,**两条路都实现，都用 marker 去重**。
-  只挂在 PR 事件上的话，主干挂了就没人看得见。
-- **回写失败必须让 job 变红。** 报告没送达等于这次没跑。写完还会回读一次确认评论真的存在。
+**慢闸门的触发是时间驱动的，不是提交驱动的。** 上游改响应格式那天，我们可能一行代码都没推，
+靠 push 触发发现不了。所以它跑在：PR、主干推送、**每天一次定时**、手动触发。分支推送不跑。
+
+- **报告目的地一人一个，不抢。** PR 事件写 PR 评论；push 和定时写 commit 评论。
+  **push 事件绝不写 PR 评论**,同一个提交上 push 和 pull_request 两个事件会同时跑，
+  都往同一条 PR 评论写的话，后到的那个会把「本轮没跑」盖在完整报告上面。
+- **定时跑发现漂移会开 issue**（恢复后自动关）。定时跑没有 PR，它的 commit 评论落在一个
+  可能一周没动过的主干 SHA 上，没人会看。
+- **「慢闸门被跳过」只有在我们预测到它会被跳过时才可接受。** verdict 那步独立算一遍
+  「这次该不该跑」，和 job 结果对不上就红,两个方向都红。理由：job 的 `if:` 一旦写歪，
+  唯一的漂移探测器会静默永不执行，而所有 run 依然全绿。这是唯一一处失效会掩盖自己的位置。
+- 分支推送时报告里**明写**「真实响应结构这一轮没有被验证」。省掉这句，一条绿评论
+  读起来就像漂移检查过了。
+- **回写失败必须让 job 变红**，写完还回读一次确认评论真的在。报告没送达等于这次没跑。
+- 快闸门的输出走了 `| tee`，所以那步必须 `set -o pipefail`,否则 bash 报的是 `tee` 的
+  退出码，闸门红了 job 也会绿。有断言守着。
 - 报告自带证据：失败的测试名、期望值与实际值、日志尾巴、慢闸门的响应 id 与计数。
   判断标准只有一条:只看那条评论，能不能定位到根因。
+
+## 合并方式
+
+本仓库用 squash 合并。**squash 之后，基于旧提交的分支会被孤立**,别硬解冲突，从最新主干
+开新分支把改动重放一遍，开新 PR，关掉旧的。这事已经发生过一次。
 
 ## 人工环节（agent 碰不到）
 
 - 仓库 secrets 里的 `STEPFUN_API_KEY`。
 - Actions 的工作流写权限（不开的话报告传不回来，job 会直接红）。
+- 定时任务被 GitHub 自动停用后的重新启用（见上）。
 - 「输出读起来对不对」这类验收。机器只判结构，不判好用。

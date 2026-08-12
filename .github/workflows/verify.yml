@@ -1,10 +1,18 @@
 name: verify
 
+# Response-structure drift is time driven, not commit driven: upstream can change
+# the envelope on a day nobody pushes anything. So the live gate is triggered by
+# a clock as well as by code, and it is deliberately NOT run on every feature
+# branch push.
 on:
   push:
     branches: ['**']
   pull_request:
     types: [opened, synchronize, reopened]
+  schedule:
+    # Daily. Off the hour on purpose: cron at :00 is the most congested slot and
+    # GitHub delays those runs the most.
+    - cron: '17 2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -13,7 +21,9 @@ permissions:
   issues: write
 
 concurrency:
-  group: verify-${{ github.ref }}
+  # The event name is part of the group so a scheduled drift check never queues
+  # behind a push, and vice versa: on schedule github.ref is also refs/heads/main.
+  group: verify-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -51,6 +61,16 @@ jobs:
 
   live:
     name: live gate (real api)
+    # PRs, main, the daily clock, and manual runs. Feature-branch pushes skip it:
+    # the fast gate already covers our own parser, and a real API call per push
+    # buys nothing the daily run does not already cover.
+    # The report job asserts this skip was intentional, so a typo here cannot
+    # quietly switch off the only drift detector we have.
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -106,19 +126,37 @@ jobs:
         continue-on-error: true
         with:
           path: incoming
+      - name: decide whether the live gate was supposed to run
+        id: expect
+        run: |
+          event="${{ github.event_name }}"
+          ref="${{ github.ref }}"
+          expected=false
+          case "$event" in
+            pull_request|schedule|workflow_dispatch) expected=true ;;
+            push) if [ "$ref" = "refs/heads/main" ]; then expected=true; fi ;;
+          esac
+          echo "live=$expected" >> "$GITHUB_OUTPUT"
+          echo "live gate expected to run: $expected (event=$event ref=$ref)"
       - name: write back report
         id: writeback
         uses: actions/github-script@v7
         env:
           FAST_RESULT: ${{ needs.fast.result }}
           LIVE_RESULT: ${{ needs.live.result }}
+          LIVE_EXPECTED: ${{ steps.expect.outputs.live }}
         with:
           retries: 3
           script: |
             const fs = require('fs');
             const MARKER = '<!-- meetnote-verify-report -->';
+            const ISSUE_MARKER = '<!-- meetnote-live-contract-alert -->';
             const { owner, repo } = context.repo;
             const sha = context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+            const liveExpected = process.env.LIVE_EXPECTED === 'true';
+            const liveResult = process.env.LIVE_RESULT;
+            const isSchedule = context.eventName === 'schedule';
+            const runUrl = process.env.GITHUB_SERVER_URL + '/' + owner + '/' + repo + '/actions/runs/' + context.runId;
 
             const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } };
             const readJson = (p) => { const t = read(p); if (!t) { return null; } try { return JSON.parse(t); } catch (e) { return null; } };
@@ -129,7 +167,8 @@ jobs:
             const liveLog = read('incoming/live-report/live.stdout.log');
 
             const L = [MARKER, '## meetnote verify', ''];
-            L.push('commit `' + sha.slice(0, 7) + '` | fast job **' + process.env.FAST_RESULT + '** | live job **' + process.env.LIVE_RESULT + '**');
+            L.push('commit `' + sha.slice(0, 7) + '` | trigger `' + context.eventName + '` | ' + new Date().toISOString() + ' | [run](' + runUrl + ')');
+            L.push('fast job **' + process.env.FAST_RESULT + '** | live job **' + liveResult + '**');
             L.push('');
 
             if (!fast) {
@@ -156,7 +195,12 @@ jobs:
             }
 
             L.push('');
-            if (!live) {
+            if (!liveExpected && liveResult === 'skipped') {
+              // Saying nothing here would let a green comment read as if drift had
+              // been checked. It was not.
+              L.push('### live gate: 本轮没跑（分支推送不触发慢闸门）');
+              L.push('真实响应结构这一轮**没有被验证**。漂移检查跟 PR / 主干 / 每日定时走，不跟分支推送走。');
+            } else if (!live) {
               L.push('### live gate: 报告没送到');
               L.push('慢闸门没有产出报告，真实响应结构这一轮没有被验证。');
               if (liveLog) { L.push(''); L.push('```'); L.push(liveLog.split('\n').slice(-20).join('\n')); L.push('```'); }
@@ -202,12 +246,13 @@ jobs:
               return created.data.id;
             }
 
-            let issueNumber = context.payload.pull_request ? context.payload.pull_request.number : null;
-            if (!issueNumber) {
-              const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
-              const open = (prs.data || []).filter((p) => p.state === 'open');
-              if (open.length) { issueNumber = open[0].number; }
-            }
+            // ANTI-CLOBBER: one destination, one owner. Pushing to a branch with an
+            // open PR fires BOTH a push run and a pull_request run for the same
+            // commit. The push run skips the live gate, so if it also wrote to the
+            // marked PR comment it could land second and overwrite the full report
+            // with "live gate did not run". So the PR comment belongs to
+            // pull_request runs only; push and schedule runs own the commit comment.
+            const issueNumber = context.payload.pull_request ? context.payload.pull_request.number : null;
 
             let id = null;
             let where = '';
@@ -227,6 +272,30 @@ jobs:
               throw new Error('readback failed: the report comment is not there');
             }
             core.info('report written to ' + where + ' comment ' + id);
+
+            // A scheduled run has no PR, and its commit comment lands on a main SHA
+            // that may not have moved in a week. Nobody reads that. So drift found
+            // by the clock is escalated to an issue, and the issue is closed again
+            // once the contract is back.
+            if (!isSchedule) { return; }
+            const drifted = Boolean(live) && live.status === 'drift';
+            const issues = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'all', per_page: 100 });
+            const tracker = issues.find((i) => !i.pull_request && i.body && i.body.includes(ISSUE_MARKER)) || null;
+            const issueBody = [ISSUE_MARKER, '每日慢闸门的结论。这条 issue 由 CI 维护：漂移时打开，恢复后自动关闭。', '', body].join('\n');
+
+            if (drifted) {
+              const title = 'live contract drift: StepFun 响应结构和我们的契约不一致';
+              if (tracker) {
+                await github.rest.issues.update({ owner, repo, issue_number: tracker.number, title, body: issueBody, state: 'open' });
+                core.info('reopened drift issue #' + tracker.number);
+              } else {
+                const created = await github.rest.issues.create({ owner, repo, title, body: issueBody });
+                core.info('opened drift issue #' + created.data.number);
+              }
+            } else if (tracker && tracker.state === 'open') {
+              await github.rest.issues.update({ owner, repo, issue_number: tracker.number, body: issueBody, state: 'closed' });
+              core.info('closed drift issue #' + tracker.number + ': the contract is back');
+            }
       - name: confirm writeback reached a comment
         if: steps.writeback.outcome != 'success'
         run: |
@@ -234,9 +303,28 @@ jobs:
           exit 1
       - name: verdict
         run: |
-          echo "fast=${{ needs.fast.result }} live=${{ needs.live.result }}"
-          if [ "${{ needs.fast.result }}" != "success" ] || [ "${{ needs.live.result }}" != "success" ]; then
-            echo "at least one gate did not pass"
+          fast="${{ needs.fast.result }}"
+          live="${{ needs.live.result }}"
+          expected="${{ steps.expect.outputs.live }}"
+          echo "fast=$fast live=$live live_expected=$expected event=${{ github.event_name }}"
+          if [ "$fast" != "success" ]; then
+            echo "fast gate did not pass"
             exit 1
           fi
-          echo "all gates green"
+          if [ "$expected" = "true" ]; then
+            if [ "$live" != "success" ]; then
+              echo "the live gate was supposed to run here and did not pass"
+              exit 1
+            fi
+            echo "all gates green"
+            exit 0
+          fi
+          # A skip is only acceptable because we predicted it. Any other outcome
+          # means the job condition stopped matching the documented policy, and a
+          # drift detector that quietly stops running is the single failure that
+          # hides itself: everything stays green forever.
+          if [ "$live" != "skipped" ]; then
+            echo "the live gate was expected to be skipped but reported '$live'; the trigger policy no longer matches the docs"
+            exit 1
+          fi
+          echo "live gate skipped on purpose (feature branch push). real response drift was NOT checked this round"

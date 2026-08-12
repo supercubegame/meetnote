@@ -1,8 +1,8 @@
 """Command line entry point. All I/O lives here; core.py stays pure.
 
 Exit codes are part of the contract and are asserted end-to-end:
-  0 result produced (status may be "unconfirmed", that is a labelled result)
-  2 usage error (empty input, missing key)
+  0 result produced (status may be "unconfirmed", which is a labelled result)
+  2 usage error (bad flags, unreadable or empty input, missing key)
   3 --strict was given and the result is unconfirmed
   4 could not confirm anything: API unreachable, throttled, or auth rejected
   5 contract drift: the endpoint or the response envelope changed
@@ -31,8 +31,8 @@ ENV_KEY = "STEPFUN_API_KEY"
 ENV_STUB = "MEETNOTE_STUB_FILE"
 
 # Read-only diagnostic snapshot. Field names may be ADDED, never renamed or
-# removed: test_meta.test_diag_field_names_are_stable pins this tuple, and the
-# e2e tests read these names. See AGENTS.md.
+# removed: test_meta.test_diag_field_names_are_stable pins this tuple by
+# equality and the e2e tests read these names. See AGENTS.md.
 DIAG_FIELDS = (
     "attempts",
     "waits_ms",
@@ -42,6 +42,7 @@ DIAG_FIELDS = (
     "model",
     "today",
     "contract_paths_checked",
+    "retry_budget",
 )
 
 
@@ -54,6 +55,8 @@ def build_parser():
     p.add_argument("--model", default=core.MODEL)
     p.add_argument("--endpoint", default=core.ENDPOINT)
     p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--retry-budget", type=int, default=core.MAX_RETRIES, help="可用重试次数")
+    p.add_argument("--backoff-scale", type=float, default=1.0, help="缩放重试等待，调试与测试用")
     p.add_argument("--out", default=None, help="同时把结果写到文件")
     p.add_argument("--log", default=None, help="把运行日志写到文件（已脱敏）")
     p.add_argument("--strict", action="store_true", help="结果为 unconfirmed 时以退出码 3 结束")
@@ -69,12 +72,6 @@ def _read_notes(path):
         return fh.read()
 
 
-def _resolve_today(raw):
-    if not raw:
-        return date.today()
-    return date.fromisoformat(raw)
-
-
 def run(argv):
     args = build_parser().parse_args(argv)
     api_key = os.environ.get(ENV_KEY, "")
@@ -86,7 +83,7 @@ def run(argv):
         return code
 
     try:
-        today = _resolve_today(args.today)
+        today = date.fromisoformat(args.today) if args.today else date.today()
     except ValueError:
         emitter.err("usage_error: --today 必须是 YYYY-MM-DD")
         return finish(EXIT_USAGE)
@@ -116,10 +113,17 @@ def run(argv):
         transport = client_mod.UrllibTransport(timeout=args.timeout)
         emitter.log("transport=urllib")
 
-    api = client_mod.Client(transport, api_key, emitter=emitter, endpoint=args.endpoint)
+    api = client_mod.Client(
+        transport,
+        api_key,
+        emitter=emitter,
+        endpoint=args.endpoint,
+        retry_budget=args.retry_budget,
+        backoff_scale=args.backoff_scale,
+    )
 
-    def diag(extra=None):
-        snapshot = {
+    def diag():
+        return {
             "attempts": api.attempts,
             "waits_ms": list(api.waits_ms),
             "http_status": api.last_status,
@@ -128,13 +132,17 @@ def run(argv):
             "model": args.model,
             "today": today.isoformat(),
             "contract_paths_checked": len(core.REQUIRED_RESPONSE_PATHS),
+            "retry_budget": api.retry_budget,
         }
-        if extra:
-            snapshot.update(extra)
-        return snapshot
+
+    labels = {
+        EXIT_UNAVAILABLE: "unconfirmed",
+        EXIT_CONTRACT: "contract_drift",
+        EXIT_CONTENT: "content_error",
+    }
 
     def fail(code, reason, detail=None):
-        emitter.err("%s: %s" % ({EXIT_UNAVAILABLE: "unconfirmed", EXIT_CONTRACT: "contract_drift", EXIT_CONTENT: "content_error"}.get(code, "error"), reason))
+        emitter.err("%s: %s" % (labels.get(code, "error"), reason))
         if detail:
             emitter.err("detail: %s" % detail)
         emitter.log("exit=%d reason=%s detail=%s" % (code, reason, detail))
@@ -160,9 +168,9 @@ def run(argv):
     if problems:
         return fail(EXIT_CONTRACT, "envelope_violations", ",".join(problems))
 
-    message = envelope["choices"][0]
-    content = message["message"]["content"]
-    finish_reason = message.get("finish_reason", "stop")
+    choice = envelope["choices"][0]
+    content = choice["message"]["content"]
+    finish_reason = choice.get("finish_reason", "stop")
 
     try:
         result = core.parse_content(content, today=today, finish_reason=finish_reason)

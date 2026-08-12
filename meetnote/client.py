@@ -107,11 +107,11 @@ class UrllibTransport:
 
 
 class StubTransport:
-    """Test-only. Replays a script of canned responses.
+    """Test-only. Replays a script of canned responses; the last step repeats.
 
     Recorded responses always match our own expectations, so this can never
-    detect real drift. That job belongs to verify_live.py, and live_check
-    actively refuses anything that looks recorded.
+    detect real drift. That job belongs to verify_live.py, which refuses to run
+    against anything that looks recorded.
     """
 
     def __init__(self, script):
@@ -125,7 +125,7 @@ class StubTransport:
         return cls(data["responses"])
 
     def post(self, url, headers, body):
-        self.calls.append({"url": url, "body": body})
+        self.calls.append({"url": url, "headers": dict(headers), "body": body})
         idx = min(len(self.calls) - 1, len(self.script) - 1)
         step = self.script[idx]
         if step.get("raise"):
@@ -136,26 +136,41 @@ class StubTransport:
         return int(step["status"]), (raw or "").encode("utf-8")
 
 
-def backoff_ms(attempt):
-    """attempt is 1-based. The cap is reachable at attempt == MAX_RETRIES."""
+def backoff_ms(attempt, scale=1.0):
+    """attempt is 1-based. At the DEFAULT budget the cap is reachable exactly at
+    attempt == core.MAX_RETRIES; test_meta asserts that pair stays consistent.
+    Lowering --retry-budget makes the cap unreachable on purpose.
+    """
     raw = core.BACKOFF_BASE_MS * (core.BACKOFF_FACTOR ** (attempt - 1))
-    return min(raw, core.BACKOFF_CAP_MS)
+    return max(0, int(round(min(raw, core.BACKOFF_CAP_MS) * scale)))
 
 
 class Client:
-    def __init__(self, transport, api_key, *, clock=None, emitter=None, endpoint=core.ENDPOINT):
+    def __init__(
+        self,
+        transport,
+        api_key,
+        *,
+        clock=None,
+        emitter=None,
+        endpoint=core.ENDPOINT,
+        retry_budget=None,
+        backoff_scale=1.0,
+    ):
         self.transport = transport
         self.api_key = api_key
         self.clock = clock or RealClock()
         self.emitter = emitter
         self.endpoint = endpoint
+        self.retry_budget = core.MAX_RETRIES if retry_budget is None else int(retry_budget)
+        self.backoff_scale = float(backoff_scale)
         self.attempts = 0
         self.attempt_times_ms = []
         self.waits_ms = []
         self.last_status = None
 
     def build_headers(self):
-        """The only place the key is ever put on the wire."""
+        """The only place the key is ever put on the wire. Never logged."""
         return {
             "Content-Type": "application/json",
             "Authorization": "Bearer %s" % (self.api_key or ""),
@@ -170,7 +185,7 @@ class Client:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = self.build_headers()
         last = None
-        for attempt in range(1, core.MAX_RETRIES + 2):
+        for attempt in range(1, self.retry_budget + 2):
             self.attempts = attempt
             self.attempt_times_ms.append(self.clock.now_ms())
             self._log("attempt %d -> %s" % (attempt, self.endpoint))
@@ -189,9 +204,9 @@ class Client:
             except AvailabilityError as exc:
                 last = exc
                 self._log("attempt %d availability failure %s" % (attempt, exc.reason))
-                if attempt > core.MAX_RETRIES:
+                if attempt > self.retry_budget:
                     break
-                wait = backoff_ms(attempt)
+                wait = backoff_ms(attempt, self.backoff_scale)
                 self.waits_ms.append(wait)
                 self._log("backoff %dms" % wait)
                 self.clock.sleep_ms(wait)

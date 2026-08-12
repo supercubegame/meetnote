@@ -62,8 +62,8 @@ jobs:
   live:
     name: live gate (real api)
     # PRs, main, the daily clock, and manual runs. Feature-branch pushes skip it:
-    # the fast gate already covers our own parser, and burning a real API call per
-    # push buys nothing that the daily run does not already cover.
+    # the fast gate already covers our own parser, and a real API call per push
+    # buys nothing the daily run does not already cover.
     # The report job asserts this skip was intentional, so a typo here cannot
     # quietly switch off the only drift detector we have.
     if: >-
@@ -246,12 +246,13 @@ jobs:
               return created.data.id;
             }
 
-            let issueNumber = context.payload.pull_request ? context.payload.pull_request.number : null;
-            if (!issueNumber) {
-              const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
-              const open = (prs.data || []).filter((p) => p.state === 'open');
-              if (open.length) { issueNumber = open[0].number; }
-            }
+            // ANTI-CLOBBER: one destination, one owner. Pushing to a branch with an
+            // open PR fires BOTH a push run and a pull_request run for the same
+            // commit. The push run skips the live gate, so if it also wrote to the
+            // marked PR comment it could land second and overwrite the full report
+            // with "live gate did not run". So the PR comment belongs to
+            // pull_request runs only; push and schedule runs own the commit comment.
+            const issueNumber = context.payload.pull_request ? context.payload.pull_request.number : null;
 
             let id = null;
             let where = '';
@@ -274,13 +275,13 @@ jobs:
 
             // A scheduled run has no PR, and its commit comment lands on a main SHA
             // that may not have moved in a week. Nobody reads that. So drift found
-            // by the clock is escalated to an issue, which is the one place a human
-            // actually looks, and it is closed again once the contract is back.
+            // by the clock is escalated to an issue, and the issue is closed again
+            // once the contract is back.
             if (!isSchedule) { return; }
-            const drifted = live && live.status === 'drift';
+            const drifted = Boolean(live) && live.status === 'drift';
             const issues = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'all', per_page: 100 });
             const tracker = issues.find((i) => !i.pull_request && i.body && i.body.includes(ISSUE_MARKER)) || null;
-            const issueBody = [ISSUE_MARKER, '每日慢闸门的结论。这条 issue 由 CI 维护，漂移时打开，恢复后自动关闭。', '', body].join('\n');
+            const issueBody = [ISSUE_MARKER, '每日慢闸门的结论。这条 issue 由 CI 维护：漂移时打开，恢复后自动关闭。', '', body].join('\n');
 
             if (drifted) {
               const title = 'live contract drift: StepFun 响应结构和我们的契约不一致';
@@ -293,7 +294,7 @@ jobs:
               }
             } else if (tracker && tracker.state === 'open') {
               await github.rest.issues.update({ owner, repo, issue_number: tracker.number, body: issueBody, state: 'closed' });
-              core.info('closed drift issue #' + tracker.number + ': contract is back');
+              core.info('closed drift issue #' + tracker.number + ': the contract is back');
             }
       - name: confirm writeback reached a comment
         if: steps.writeback.outcome != 'success'

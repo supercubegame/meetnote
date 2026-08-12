@@ -176,9 +176,9 @@ class CheckCount(unittest.TestCase):
 class Workflow(unittest.TestCase):
     """Static checks over the CI definition.
 
-    These are pattern matches over YAML, so every one of them first proves it
-    actually parsed a non-empty region. A scan that silently matches nothing is
-    the same thing as an assertion that is always true.
+    These are pattern matches over YAML, so each one first proves it actually
+    parsed a non-empty region. A scan that silently matches nothing is the same
+    thing as an assertion that is always true.
     """
 
     def _text(self):
@@ -201,7 +201,6 @@ class Workflow(unittest.TestCase):
         for needle in (
             "issues.createComment",
             "issues.updateComment",
-            "listPullRequestsAssociatedWithCommit",
             "createCommitComment",
             "updateCommitComment",
         ):
@@ -253,9 +252,9 @@ class Workflow(unittest.TestCase):
 
     def test_a_skipped_live_gate_is_only_ok_when_predicted(self):
         """The one failure mode that hides itself: if the live job's condition stops
-        matching the documented policy, it silently never runs and every run stays
-        green. So the verdict compares the job result against an independently
-        computed expectation and fails on any mismatch, in either direction."""
+        matching the documented policy it silently never runs, and every run stays
+        green forever. So the verdict compares the job result against an
+        independently computed expectation and fails on a mismatch either way."""
         region = self._report_job(self._text())
         expect = region[region.index("id: expect") : region.index("write back report")]
         self.assertGreater(len(expect), 200)
@@ -283,6 +282,24 @@ class Workflow(unittest.TestCase):
         region = self._report_job(self._text())
         self.assertIn("liveExpected", region)
         self.assertIn("没有被验证", region)
+
+    def test_push_runs_cannot_clobber_the_pr_report(self):
+        """One destination, one owner. A push to a branch with an open PR fires both
+        a push run and a pull_request run for the same commit; the push run skips
+        the live gate, so if it also owned the PR comment it could land second and
+        overwrite the full report with "live gate did not run"."""
+        region = self._report_job(self._text())
+        self.assertIn("ANTI-CLOBBER", region)
+        self.assertIn(
+            "const issueNumber = context.payload.pull_request ? context.payload.pull_request.number : null;",
+            region,
+        )
+        self.assertNotIn(
+            "listPullRequestsAssociatedWithCommit",
+            region,
+            "resolving a PR from the commit puts the push run back in charge of the "
+            "PR comment, which is exactly the clobber this rule prevents",
+        )
 
 
 if __name__ == "__main__":

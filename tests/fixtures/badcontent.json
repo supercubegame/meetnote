@@ -1,0 +1,26 @@
+{
+  "note": "Envelope is fine, the model answered in prose. Our schema cannot be produced at all, which is a distinct outcome from unconfirmed.",
+  "responses": [
+    {
+      "status": 200,
+      "body_json": {
+        "id": "fixture-badcontent-001",
+        "model": "step-3.7-flash",
+        "choices": [
+          {
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+              "role": "assistant",
+              "content": "当然可以！这次会议主要讨论了 CSV 导入的问题，参会人有陈迪和林岚。"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 388,
+          "completion_tokens": 41
+        }
+      }
+    }
+  ]
+}

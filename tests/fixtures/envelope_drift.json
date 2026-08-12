@@ -1,0 +1,25 @@
+{
+  "note": "200 OK but usage.completion_tokens vanished. This is what a real provider-side envelope change looks like from our side.",
+  "responses": [
+    {
+      "status": 200,
+      "body_json": {
+        "id": "fixture-drift-001",
+        "model": "step-3.7-flash",
+        "choices": [
+          {
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+              "role": "assistant",
+              "content": "{\"participants\": [], \"decisions\": [], \"action_items\": []}"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 100
+        }
+      }
+    }
+  ]
+}

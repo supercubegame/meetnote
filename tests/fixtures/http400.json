@@ -1,0 +1,9 @@
+{
+  "note": "The endpoint rejects our request shape. Contract drift, not an outage: must never be retried and must never be reported as unconfirmed.",
+  "responses": [
+    {
+      "status": 400,
+      "body": "{\"error\": {\"message\": \"unknown parameter: response_format\", \"type\": \"invalid_request_error\"}}"
+    }
+  ]
+}

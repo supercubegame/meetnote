@@ -1,0 +1,242 @@
+name: verify
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fast:
+    name: fast gate (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: run fast gate
+        id: gate
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          # pipefail is not on by default: without it bash would report tee's exit
+          # code and a failing gate would look green.
+          set -o pipefail
+          python verify.py --report reports/fast.json --log reports/fast.log 2>&1 | tee reports/fast.stdout.log
+      - name: upload fast report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-report
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: fail if fast gate failed
+        if: steps.gate.outcome != 'success'
+        run: |
+          echo "fast gate failed; see the verify report comment"
+          exit 1
+
+  live:
+    name: live gate (real api)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: run live gate
+        id: gate
+        env:
+          STEPFUN_API_KEY: ${{ secrets.STEPFUN_API_KEY }}
+        run: |
+          mkdir -p reports
+          set +e
+          python verify_live.py --report reports/live.json > reports/live.stdout.log 2>&1
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          tail -n 40 reports/live.stdout.log || true
+          exit 0
+      - name: upload live report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-report
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: classify live outcome
+        run: |
+          code="${{ steps.gate.outputs.code }}"
+          echo "live gate exit code: $code"
+          if [ "$code" = "0" ]; then
+            echo "live gate: real response matched the contract"
+            exit 0
+          fi
+          if [ "$code" = "78" ]; then
+            echo "live gate: unconfirmed (no secret, or the api was unavailable). this is not a pass, nothing real was verified"
+            exit 0
+          fi
+          echo "live gate: the real response contract drifted, or a replay guard failed"
+          exit 1
+
+  report:
+    name: report
+    needs: [fast, live]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: download reports
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: incoming
+      - name: write back report
+        id: writeback
+        uses: actions/github-script@v7
+        env:
+          FAST_RESULT: ${{ needs.fast.result }}
+          LIVE_RESULT: ${{ needs.live.result }}
+        with:
+          retries: 3
+          script: |
+            const fs = require('fs');
+            const MARKER = '<!-- meetnote-verify-report -->';
+            const { owner, repo } = context.repo;
+            const sha = context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } };
+            const readJson = (p) => { const t = read(p); if (!t) { return null; } try { return JSON.parse(t); } catch (e) { return null; } };
+
+            const fast = readJson('incoming/fast-report/fast.json');
+            const live = readJson('incoming/live-report/live.json');
+            const fastLog = read('incoming/fast-report/fast.log') || read('incoming/fast-report/fast.stdout.log');
+            const liveLog = read('incoming/live-report/live.stdout.log');
+
+            const L = [MARKER, '## meetnote verify', ''];
+            L.push('commit `' + sha.slice(0, 7) + '` | fast job **' + process.env.FAST_RESULT + '** | live job **' + process.env.LIVE_RESULT + '**');
+            L.push('');
+
+            if (!fast) {
+              L.push('### fast gate: 报告没送到');
+              L.push('离线闸门没有产出报告，这一轮当作没跑。');
+              if (fastLog) { L.push(''); L.push('```'); L.push(fastLog.split('\n').slice(-25).join('\n')); L.push('```'); }
+            } else {
+              L.push('### fast gate: `' + fast.status + '` — ' + fast.checks_passed + '/' + fast.checks_run + ' 条通过（应为 ' + fast.expected_checks + ' 条，' + fast.duration_s + 's）');
+              for (const h of (fast.hard_errors || [])) { L.push('- **hard**: `' + h + '`'); }
+              const fails = fast.failures || [];
+              if (fails.length) {
+                L.push('');
+                L.push('<details><summary>失败明细 ' + fails.length + ' 条</summary>');
+                L.push('');
+                for (const f of fails.slice(0, 10)) {
+                  L.push('**' + f.test + '**');
+                  L.push('');
+                  L.push('```');
+                  L.push(f.summary);
+                  L.push('```');
+                }
+                L.push('</details>');
+              }
+            }
+
+            L.push('');
+            if (!live) {
+              L.push('### live gate: 报告没送到');
+              L.push('慢闸门没有产出报告，真实响应结构这一轮没有被验证。');
+              if (liveLog) { L.push(''); L.push('```'); L.push(liveLog.split('\n').slice(-20).join('\n')); L.push('```'); }
+            } else {
+              const e = live.evidence || {};
+              L.push('### live gate: `' + live.status + '` — ' + live.checks_passed + '/' + live.checks_run + ' 条通过');
+              L.push('- 打了真实请求: `' + String(e.attempted_request) + '` | 尝试 `' + String(e.attempts) + '` 次 | 耗时 `' + String(e.elapsed_ms) + 'ms`');
+              L.push('- 响应 id `' + String(e.response_id) + '`（已知录音 id ' + String(e.fixture_ids_known) + ' 个）| 抽取计数 `' + JSON.stringify(e.counts || null) + '`');
+              if (e.envelope_additions && e.envelope_additions.length) { L.push('- 新增字段（只报告，不判红）: `' + e.envelope_additions.join(', ') + '`'); }
+              for (const d of (live.drift || [])) { L.push('- **drift**: `' + d + '`'); }
+              for (const u of (live.unconfirmed_reasons || [])) { L.push('- unconfirmed: `' + u + '`'); }
+              const bad = (live.checks || []).filter((c) => !c.ok);
+              if (bad.length) {
+                L.push('');
+                L.push('<details><summary>未通过的检查 ' + bad.length + ' 条</summary>');
+                L.push('');
+                for (const c of bad) { L.push('- `' + c.id + '`: ' + c.detail); }
+                L.push('</details>');
+              }
+            }
+
+            const body = L.join('\n');
+
+            async function upsertIssueComment(issueNumber) {
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: issueNumber, per_page: 100 });
+              const existing = comments.find((c) => c.body && c.body.includes(MARKER));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+                return existing.id;
+              }
+              const created = await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
+              return created.data.id;
+            }
+
+            async function upsertCommitComment() {
+              const comments = await github.paginate(github.rest.repos.listCommentsForCommit, { owner, repo, commit_sha: sha, per_page: 100 });
+              const existing = comments.find((c) => c.body && c.body.includes(MARKER));
+              if (existing) {
+                await github.rest.repos.updateCommitComment({ owner, repo, comment_id: existing.id, body });
+                return existing.id;
+              }
+              const created = await github.rest.repos.createCommitComment({ owner, repo, commit_sha: sha, body });
+              return created.data.id;
+            }
+
+            let issueNumber = context.payload.pull_request ? context.payload.pull_request.number : null;
+            if (!issueNumber) {
+              const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+              const open = (prs.data || []).filter((p) => p.state === 'open');
+              if (open.length) { issueNumber = open[0].number; }
+            }
+
+            let id = null;
+            let where = '';
+            if (issueNumber) {
+              id = await upsertIssueComment(issueNumber);
+              where = 'pr#' + issueNumber;
+            } else {
+              id = await upsertCommitComment();
+              where = 'commit ' + sha.slice(0, 7);
+            }
+            if (!id) { throw new Error('writeback produced no comment id'); }
+
+            const check = issueNumber
+              ? await github.rest.issues.getComment({ owner, repo, comment_id: id })
+              : await github.rest.repos.getCommitComment({ owner, repo, comment_id: id });
+            if (!check.data.body || !check.data.body.includes(MARKER)) {
+              throw new Error('readback failed: the report comment is not there');
+            }
+            core.info('report written to ' + where + ' comment ' + id);
+      - name: confirm writeback reached a comment
+        if: steps.writeback.outcome != 'success'
+        run: |
+          echo "the report never reached a comment, so nobody can read this run. treating it as not run"
+          exit 1
+      - name: verdict
+        run: |
+          echo "fast=${{ needs.fast.result }} live=${{ needs.live.result }}"
+          if [ "${{ needs.fast.result }}" != "success" ] || [ "${{ needs.live.result }}" != "success" ]; then
+            echo "at least one gate did not pass"
+            exit 1
+          fi
+          echo "all gates green"

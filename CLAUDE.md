@@ -18,9 +18,9 @@
 - `meetnote/output.py`：唯一输出闸口，stdout / stderr / 日志 / 文件均脱敏。
 - `meetnote/cli.py`：命令行 I/O；生产功能未因停用 CI 自动请求而被删除。
 - `meetnote/live_check.py`、`verify_live.py`：真实接口验收逻辑，保留不弱化。
-- `tests/fixtures/*.json`：假响应只证明本地行为，不证明外部接口没变化。
 - `verify.py`：零网络快闸门。每次代码修改后必须运行。
 - `checks/live_opt_in_check.py`：真实 workflow 条件与预期 shell 的无网络反例。
+- `tests/fixtures/*.json`：假响应只证明本地行为，不证明外部接口没变化。
 
 ## 命令
 

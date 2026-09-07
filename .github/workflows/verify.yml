@@ -230,6 +230,28 @@ jobs:
             const fastLog = read('incoming/fast-report/fast.log') || read('incoming/fast-report/fast.stdout.log');
             const liveLog = read('incoming/live-report/live.stdout.log');
 
+            // Recovery is positive evidence, not the absence of a drift label.
+            // This guard validates report semantics; explicit run provenance is a separate contract.
+            function canCloseAlert(r, job) {
+              if (!r || typeof r !== 'object' || Array.isArray(r) || job !== 'success') return false;
+              if (r.status !== 'ok' || r.exit_code !== 0) return false;
+              if (!Array.isArray(r.drift) || r.drift.length || !Array.isArray(r.unconfirmed_reasons) || r.unconfirmed_reasons.length) return false;
+              if (!Array.isArray(r.checks) || !r.checks.length || !Number.isInteger(r.checks_run) || !Number.isInteger(r.checks_passed)) return false;
+              if (r.checks_run !== r.checks.length || r.checks_passed !== r.checks.length) return false;
+              if (!r.checks.every(c => c && typeof c.id === 'string' && c.id.length && c.ok === true)) return false;
+              const ids = new Set(r.checks.map(c => c.id));
+              const required = ['stub_channel_absent', 'contract_not_emptied', 'endpoint_is_real', 'transport_is_real', 'key_absent_from_repo', 'request_contract_accepted', 'envelope_is_json', 'envelope_matches_contract', 'response_is_not_a_recording', 'content_matches_schema', 'nonce_echoed_by_model', 'probe_yielded_extractions'];
+              if (ids.size !== r.checks.length || !required.every(id => ids.has(id))) return false;
+              const e = r.evidence;
+              return Boolean(e && e.attempted_request === true && typeof e.response_id === 'string' && e.response_id.length && !e.response_id.startsWith('fixture-'));
+            }
+            // These cases run before any remote side effect and use the production guard.
+            const checkIds = ['stub_channel_absent', 'contract_not_emptied', 'endpoint_is_real', 'transport_is_real', 'key_absent_from_repo', 'request_contract_accepted', 'envelope_is_json', 'envelope_matches_contract', 'response_is_not_a_recording', 'content_matches_schema', 'nonce_echoed_by_model', 'probe_yielded_extractions'];
+            const good = {status:'ok', exit_code:0, drift:[], unconfirmed_reasons:[], checks_run:12, checks_passed:12, checks:checkIds.map(id=>({id,ok:true})), evidence:{attempted_request:true,response_id:'live-selftest'}};
+            const cases = [[good,'success',true],[null,'success',false],[{...good,status:'unconfirmed'},'success',false],[{...good,status:'drift'},'success',false],[good,'failure',false],[{...good,checks:[],checks_run:0,checks_passed:0},'success',false],[{...good,checks_passed:11},'success',false],[{...good,exit_code:'0'},'success',false],[{...good,evidence:{attempted_request:false}},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:{...c,ok:'true'})},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:{id:'unrelated',ok:true})},'success',false],[{...good,unconfirmed_reasons:['blocked']},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:good.checks[1])},'success',false]];
+            for (const [r,j,w] of cases) if (canCloseAlert(r,j)!==w) throw new Error('recovery guard self-test failed');
+            core.info('Recovery guard self-tests: ' + cases.length + '/' + cases.length);
+
             const L = [MARKER, '## meetnote verify', ''];
             L.push('commit `' + sha.slice(0, 7) + '` | trigger `' + context.eventName + '` | ' + new Date().toISOString() + ' | [run](' + runUrl + ')');
             L.push('fast job **' + process.env.FAST_RESULT + '** | live job **' + liveResult + '**');
@@ -289,6 +311,7 @@ jobs:
             if (isSchedule) {
               L.push('');
               L.push('心跳已写回 `.github/live-heartbeat.json`,外部审计靠它的时间戳判断这条定时任务还活着。');
+              if (!canCloseAlert(live, liveResult)) L.push('恢复未确认：不会因缺报告、未确认状态或矛盾结果关闭已有告警。');
             }
 
             const body = L.join('\n');
@@ -361,9 +384,11 @@ jobs:
                 const created = await github.rest.issues.create({ owner, repo, title, body: issueBody });
                 core.info('opened drift issue #' + created.data.number);
               }
-            } else if (tracker && tracker.state === 'open') {
+            } else if (tracker && tracker.state === 'open' && canCloseAlert(live, liveResult)) {
               await github.rest.issues.update({ owner, repo, issue_number: tracker.number, body: issueBody, state: 'closed' });
               core.info('closed drift issue #' + tracker.number + ': the contract is back');
+            } else if (tracker && tracker.state === 'open') {
+              core.warning('Keeping alert #' + tracker.number + ' open: recovery is not verified.');
             }
       - name: confirm writeback reached a comment
         if: steps.writeback.outcome != 'success'

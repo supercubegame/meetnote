@@ -140,5 +140,73 @@ class KeyHandling(unittest.TestCase):
         self.assertEqual(transport.calls[0]["url"], core.ENDPOINT)
 
 
+class SubscriptionAccess(unittest.TestCase):
+    BODY = {"error": {"type": "request_params_invalid", "message": "you have no active step plan subscription"}}
+
+    def test_subscription_denial_is_not_retried(self):
+        transport = stub({"status": 400, "body_json": self.BODY})
+        api = make_client(transport)
+        with self.assertRaises(client.AuthError) as ctx:
+            api.complete({"model": core.MODEL})
+        self.assertEqual(ctx.exception.reason, "subscription_required")
+        self.assertEqual(api.attempts, 1)
+        self.assertEqual(api.waits_ms, [])
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_subscription_detection_is_narrow(self):
+        for body in (b"not json", b"null", b"[]", b"{}",
+                     b'{"error":"you have no active step plan subscription"}',
+                     b'{"error":{"type":"other","message":"you have no active step plan subscription"}}',
+                     b'{"error":{"type":"request_params_invalid","message":"unknown parameter: response_format"}}'):
+            with self.subTest(body=body):
+                with self.assertRaises(client.ContractError):
+                    client.classify_status(400, body)
+        with self.assertRaises(client.AvailabilityError) as ctx:
+            client.classify_status(503, json.dumps(self.BODY).encode())
+        self.assertNotIsInstance(ctx.exception, client.AuthError)
+
+    def test_subscription_live_gate_is_unconfirmed(self):
+        import tempfile
+        import uuid
+        from unittest.mock import patch
+        from meetnote import live_check
+        class Denied(client.UrllibTransport):
+            def __init__(self, body):
+                super().__init__(timeout=1)
+                self.body, self.calls = body, 0
+            def post(self, url, headers, body):
+                self.calls += 1
+                return 400, json.dumps(self.body).encode()
+        transport = Denied(self.BODY)
+        with tempfile.TemporaryDirectory() as root, patch.dict("os.environ", {"MEETNOTE_STUB_FILE": ""}):
+            result = live_check.run_live(api_key=uuid.uuid4().hex, root=root,
+                                        transport=transport, clock=client.FakeClock())
+        self.assertEqual(result["status"], "unconfirmed")
+        self.assertEqual(result["exit_code"], 78)
+        self.assertEqual(result["drift"], [])
+        self.assertEqual(result["evidence"]["attempts"], 1)
+        self.assertEqual(transport.calls, 1)
+        self.assertIn("auth_rejected:subscription_required", result["unconfirmed_reasons"])
+
+    def test_subscription_cli_preserves_exit_and_reason(self):
+        import contextlib
+        import io
+        import pathlib
+        import tempfile
+        from unittest.mock import patch
+        from meetnote import cli
+        with tempfile.TemporaryDirectory() as root:
+            p = pathlib.Path(root)
+            (p / "notes.txt").write_text("Alice: deliver notes next Friday.", encoding="utf-8")
+            (p / "denied.json").write_text(json.dumps({"responses": [{"status": 400, "body_json": self.BODY}]}))
+            out, err = io.StringIO(), io.StringIO()
+            with patch.dict("os.environ", {"MEETNOTE_STUB_FILE": str(p / "denied.json"), "STEPFUN_API_KEY": ""}), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.run(["parse", str(p / "notes.txt"), "--today", "2026-09-07", "--diag"])
+        self.assertEqual(code, 4)
+        self.assertIn("subscription_required", err.getvalue())
+        self.assertNotIn("contract_drift", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

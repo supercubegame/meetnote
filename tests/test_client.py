@@ -76,6 +76,7 @@ class Retrying(unittest.TestCase):
         api = make_client(stub({"status": 503, "body": "busy"}))
         with self.assertRaises(client.AvailabilityError) as ctx:
             api.complete({"model": core.MODEL})
+        self.assertEqual(ctx.exception.reason, "api_unreachable")
         self.assertEqual(api.attempts, core.MAX_RETRIES + 1)
         self.assertEqual(api.waits_ms, [500, 1000, 2000, 4000, 8000])
         self.assertIn("http_503", ctx.exception.detail)

@@ -54,10 +54,31 @@ def _snippet(body, limit=400):
     return (body or "")[:limit]
 
 
+def subscription_rejected(body):
+    """Recognize only the observed StepFun access denial, not arbitrary HTTP 400s.
+
+    Reuse the non-retryable AuthError path with a distinct reason. This means
+    account access was rejected, not that the credential string itself is wrong.
+    Unknown messages and request-shape errors retain the existing classification.
+    """
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError, UnicodeError):
+        return False
+    error = data.get("error") if isinstance(data, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("type") == "request_params_invalid"
+        and error.get("message") == "you have no active step plan subscription"
+    )
+
+
 def classify_status(status, body=b""):
     """Raise the right error class for an HTTP status. 2xx returns None."""
     if 200 <= status < 300:
         return None
+    if status == 400 and subscription_rejected(body):
+        raise AuthError("subscription_required", _snippet(body))
     if status in AUTH_STATUSES:
         raise AuthError("http_%d" % status, _snippet(body))
     if status in RETRYABLE_STATUSES or status >= 500:
@@ -159,9 +180,9 @@ class Client:
     ):
         self.transport = transport
         self.api_key = api_key
-        self.clock = clock or RealClock()
         self.emitter = emitter
         self.endpoint = endpoint
+        self.clock = clock or RealClock()
         self.retry_budget = core.MAX_RETRIES if retry_budget is None else int(retry_budget)
         self.backoff_scale = float(backoff_scale)
         self.attempts = 0

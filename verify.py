@@ -16,6 +16,7 @@ import json
 import os
 import time
 import unittest
+from verify_live import run_identity
 
 from tests.expected_counts import EXPECTED_CHECKS
 
@@ -54,6 +55,7 @@ def main(argv=None):
     parser.add_argument("--log", default="reports/fast.log")
     args = parser.parse_args(argv)
 
+    identity = run_identity(os.environ)
     loader = unittest.TestLoader()
     stream = io.StringIO()
     per_module = {}
@@ -96,6 +98,7 @@ def main(argv=None):
     ok = not failures and not hard_errors
     log_text = stream.getvalue()
     report = {
+        "run_identity": identity,
         "gate": "fast",
         "status": "ok" if ok else "red",
         "checks_run": total,

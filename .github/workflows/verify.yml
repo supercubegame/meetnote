@@ -8,6 +8,12 @@ on:
   schedule:
     - cron: '17 2 * * *'
   workflow_dispatch:
+    inputs:
+      run_live:
+        description: 'Opt in to a real StepFun API request (may incur charges); default is no request'
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: write
@@ -32,8 +38,10 @@ jobs:
         id: gate
         continue-on-error: true
         run: |
+          set -e
           mkdir -p reports
           set -o pipefail
+          python checks/live_opt_in_check.py 2>&1 | tee reports/opt-in.log
           python checks/report_identity_check.py 2>&1 | tee reports/identity.log
           python verify.py --report reports/fast.json --log reports/fast.log 2>&1 | tee reports/fast.stdout.log
       - name: upload fast report
@@ -53,10 +61,7 @@ jobs:
   live:
     name: live gate (real api)
     if: >-
-      github.event_name == 'pull_request' ||
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      github.event_name == 'workflow_dispatch' && inputs.run_live == true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -86,7 +91,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
       - name: leave an external heartbeat
-        # Preserve the existing positive scheduled-run witness and fatal push failure.
+        # Historical schedule-only path retained, but live is now manual-only.
+        # No new heartbeat is fabricated while automatic live monitoring is inactive.
         if: always() && github.event_name == 'schedule'
         env:
           LIVE_CODE: ${{ steps.gate.outputs.code }}
@@ -166,16 +172,17 @@ jobs:
           path: incoming
       - name: decide whether the live gate was supposed to run
         id: expect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_LIVE: ${{ inputs.run_live }}
         run: |
-          event="${{ github.event_name }}"
-          ref="${{ github.ref }}"
+          set -euo pipefail
           expected=false
-          case "$event" in
-            pull_request|schedule|workflow_dispatch) expected=true ;;
-            push) if [ "$ref" = "refs/heads/main" ]; then expected=true; fi ;;
-          esac
+          if [ "$EVENT_NAME" = 'workflow_dispatch' ] && [ "$RUN_LIVE" = 'true' ]; then
+            expected=true
+          fi
           echo "live=$expected" >> "$GITHUB_OUTPUT"
-          echo "live gate expected to run: $expected (event=$event ref=$ref)"
+          echo "live gate expected to run: $expected (manual opt-in only)"
       - name: write back report
         id: writeback
         uses: actions/github-script@v7
@@ -196,7 +203,7 @@ jobs:
             const expectedRun={repository:owner+'/'+repo,sha:context.sha,run_id:String(context.runId),run_attempt:process.env.GITHUB_RUN_ATTEMPT,event_name:context.eventName};
             const repoApi=process.env.GITHUB_API_URL+'/repos/'+owner+'/'+repo;
             const runUrl=process.env.GITHUB_SERVER_URL+'/'+owner+'/'+repo+'/actions/runs/'+context.runId;
-            const liveExpected=process.env.LIVE_EXPECTED==='true',liveResult=process.env.LIVE_RESULT,isSchedule=context.eventName==='schedule';
+            const liveExpected=process.env.LIVE_EXPECTED==='true',liveResult=process.env.LIVE_RESULT,isSchedule=context.eventName==='schedule' && liveExpected;
             const read=p=>{try{return fs.readFileSync(p,'utf8');}catch{return null;}};
             const readJson=p=>{try{return JSON.parse(read(p));}catch{return null;}};
             const fast=readJson('incoming/fast-report/fast.json'),live=readJson('incoming/live-report/live.json');
@@ -204,6 +211,7 @@ jobs:
             core.setOutput('live_state',liveCurrent?live.status:'invalid');
             const fastLog=read('incoming/fast-report/fast.log')||read('incoming/fast-report/fast.stdout.log');
             const identityLog=read('incoming/fast-report/identity.log'),liveLog=read('incoming/live-report/live.stdout.log');
+            const optInLog=read('incoming/fast-report/opt-in.log');
             function canCloseAlert(r, job) {
               if (!belongsToRun(r, expectedRun)) return false;
               if (!r || typeof r !== 'object' || Array.isArray(r) || job !== 'success') return false;
@@ -225,11 +233,12 @@ jobs:
             const L=[MARKER,'## meetnote verify','', 'commit `'+sha.slice(0,7)+'` | execution `'+context.sha+'` | run `'+context.runId+'` | attempt `'+expectedRun.run_attempt+'` | [run]('+runUrl+')',
               'report policy '+policyChecks+'/'+policyChecks+' | fast/alert '+fastChecks+'/'+fastChecks+' | recovery '+cases.length+'/'+cases.length,
               'fast job **'+process.env.FAST_RESULT+'** | live job **'+liveResult+'**',''];
+            if(optInLog)L.push('<details><summary>Manual opt-in policy tests</summary>','','~~~',optInLog.slice(-5000),'~~~','</details>');
             if(fastProblems.length){L.push('### fast gate: 报告缺失、损坏或身份不符',...fastProblems.map(x=>'- '+x));}
             else {L.push('### fast gate: `'+fast.status+'` '+fast.checks_passed+'/'+fast.checks_run+' (expected '+fast.expected_checks+')', '快报告运行身份、模块计数、失败计数已核对。'); for(const h of fast.hard_errors)L.push('- hard: '+h);for(const f of fast.failures)L.push('- '+f.test+'\n~~~\n'+f.summary+'\n~~~');}
             if(identityLog)L.push('<details><summary>Producer identity tests</summary>','', '~~~',identityLog.slice(-5000),'~~~','</details>');
             if(fastProblems.length&&fastLog)L.push('~~~',fastLog.slice(-5000),'~~~');
-            if(!liveExpected&&liveResult==='skipped')L.push('### live gate: 本轮按计划未运行，真实响应没有被验证。');
+            if(!liveExpected&&liveResult==='skipped')L.push('### live gate: 功能暂不使用，自动真实接口测试已停用；本轮没有调用 StepFun，真实响应没有被验证。历史告警和心跳保留，不表示恢复。');
             else if(!liveCurrent){L.push('### live gate: '+(!live?'报告缺失或 JSON 损坏':!consistentLive(live)?'报告结构、计数或状态矛盾':'报告运行身份不符'), '本轮真实响应没有被验证；不会修改告警状态。');if(liveLog)L.push('~~~',liveLog.slice(-5000),'~~~');}
             else {const e=live.evidence;L.push('### live gate: `'+live.status+'` '+live.checks_passed+'/'+live.checks_run,
               '真实请求 `'+e.attempted_request+'` | 尝试 `'+String(e.attempts??0)+'` | 响应 id `'+String(e.response_id??'not verified')+'`',

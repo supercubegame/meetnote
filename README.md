@@ -29,7 +29,7 @@ cat 会议记录.txt | python -m meetnote.cli parse - --strict --out result.json
   "status": "unconfirmed",
   "unconfirmed_reasons": ["owner_missing", "due_unparsed"],
   "participants": [{"name": "陈迪", "role": "产品", "unconfirmed": false, "reason": null}],
-  "decisions": [{"text": "下一版本先做导入", "unconfirmed": false}],
+  "decisions": [{"text": "下一版本先做导入", "unconfirmed": false, "reason": null}],
   "action_items": [
     {"task": "补字段映射文档", "owner": null, "due_date": null, "due_date_raw": "尽快",
      "unconfirmed": true, "reasons": ["owner_missing", "due_unparsed"]}

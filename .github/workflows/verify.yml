@@ -1,17 +1,11 @@
 name: verify
 
-# Response-structure drift is time driven, not commit driven: upstream can change
-# the envelope on a day nobody pushes anything. So the live gate is triggered by
-# a clock as well as by code, and it is deliberately NOT run on every feature
-# branch push.
 on:
   push:
     branches: ['**']
   pull_request:
     types: [opened, synchronize, reopened]
   schedule:
-    # Daily. Off the hour on purpose: cron at :00 is the most congested slot and
-    # GitHub delays those runs the most.
     - cron: '17 2 * * *'
   workflow_dispatch:
 
@@ -21,8 +15,6 @@ permissions:
   issues: write
 
 concurrency:
-  # The event name is part of the group so a scheduled drift check never queues
-  # behind a push, and vice versa: on schedule github.ref is also refs/heads/main.
   group: verify-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
@@ -41,8 +33,6 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p reports
-          # pipefail is not on by default: without it bash would report tee's exit
-          # code and a failing gate would look green.
           set -o pipefail
           python checks/report_identity_check.py 2>&1 | tee reports/identity.log
           python verify.py --report reports/fast.json --log reports/fast.log 2>&1 | tee reports/fast.stdout.log
@@ -62,11 +52,6 @@ jobs:
 
   live:
     name: live gate (real api)
-    # PRs, main, the daily clock, and manual runs. Feature-branch pushes skip it:
-    # the fast gate already covers our own parser, and a real API call per push
-    # buys nothing the daily run does not already cover.
-    # The report job asserts this skip was intentional, so a typo here cannot
-    # quietly switch off the only drift detector we have.
     if: >-
       github.event_name == 'pull_request' ||
       github.event_name == 'schedule' ||
@@ -101,17 +86,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
       - name: leave an external heartbeat
-        # Why this step exists: GitHub silently disables scheduled workflows after
-        # 60 days of repository inactivity, and a disabled cron leaves this file
-        # completely untouched. So "the cron is still declared in the YAML" is an
-        # empty assertion for the exact failure it appears to guard, and nothing
-        # inside CI can catch it either: the guard would have to run on the cron
-        # that already stopped running.
-        # A dated heartbeat committed by the run itself is a positive trace that
-        # can only exist if the run really happened. Something outside the repo
-        # compares checked_at against today; stale means the daily drift check is
-        # dead, however green the repo looks. Runs on always() so an outage or a
-        # drift still proves the schedule is alive.
+        # Preserve the existing positive scheduled-run witness and fatal push failure.
         if: always() && github.event_name == 'schedule'
         env:
           LIVE_CODE: ${{ steps.gate.outputs.code }}
@@ -120,7 +95,6 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import datetime, json, os
-
           code = os.environ.get("LIVE_CODE") or ""
           status = {"0": "ok", "1": "drift", "78": "unconfirmed"}.get(code, "unknown")
           report = {}
@@ -149,19 +123,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .github/live-heartbeat.json
-          # The skip marker below is load bearing. This commit lands on main, a
-          # push to main runs the live gate, and that would write another
-          # heartbeat, forever, at one real API call per lap.
           git commit -m "chore: daily live gate heartbeat [skip ci]"
           for attempt in 1 2 3; do
             if git push origin HEAD:main; then
               echo "heartbeat landed on attempt $attempt"
               exit 0
             fi
-            echo "push failed; rebasing on main and retrying"
             git pull --rebase origin main
           done
-          echo "the heartbeat never landed. an outside auditor would read a stale file and cannot tell that apart from a dead cron, so this is fatal"
+          echo "the heartbeat never landed; this is fatal"
           exit 1
       - name: classify live outcome
         if: always()
@@ -173,10 +143,10 @@ jobs:
             exit 0
           fi
           if [ "$code" = "78" ]; then
-            echo "live gate: unconfirmed (no secret, or the api was unavailable). this is not a pass, nothing real was verified"
+            echo "live gate: unconfirmed. this is not a pass, nothing real was verified"
             exit 0
           fi
-          echo "live gate: the real response contract drifted, or a replay guard failed"
+          echo "live gate: contract drift or invalid result"
           exit 1
 
   report:
@@ -216,32 +186,24 @@ jobs:
         with:
           retries: 3
           script: |
-            const fs = require('fs');
-            const { belongsToRun, selectOwned, assertWritten, selfTest } = require(process.env.GITHUB_WORKSPACE + '/.github/report-policy.cjs');
-            const policyChecks = selfTest();
-            const MARKER = '<!-- meetnote-verify-report -->';
-            const ISSUE_MARKER = '<!-- meetnote-live-contract-alert -->';
-            const { owner, repo } = context.repo;
-            const sha = context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
-            const expectedRun = {repository: owner + '/' + repo, sha: context.sha, run_id: String(context.runId), run_attempt: process.env.GITHUB_RUN_ATTEMPT, event_name: context.eventName};
-            const repoApi = process.env.GITHUB_API_URL + '/repos/' + owner + '/' + repo;
-            const liveExpected = process.env.LIVE_EXPECTED === 'true';
-            const liveResult = process.env.LIVE_RESULT;
-            const isSchedule = context.eventName === 'schedule';
-            const runUrl = process.env.GITHUB_SERVER_URL + '/' + owner + '/' + repo + '/actions/runs/' + context.runId;
-
-            const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } };
-            const readJson = (p) => { const t = read(p); if (!t) { return null; } try { return JSON.parse(t); } catch (e) { return null; } };
-
-            const fast = readJson('incoming/fast-report/fast.json');
-            const live = readJson('incoming/live-report/live.json');
-            const liveCurrent = belongsToRun(live, expectedRun);
-            core.setOutput('live_state', liveCurrent ? live.status : 'invalid');
-            const fastLog = read('incoming/fast-report/fast.log') || read('incoming/fast-report/fast.stdout.log');
-            const identityLog = read('incoming/fast-report/identity.log');
-            const liveLog = read('incoming/live-report/live.stdout.log');
-
-            // Recovery requires both positive response evidence and this execution's identity.
+            const fs=require('fs');
+            const {belongsToRun,consistentLive,selectOwned,assertWritten,selfTest}=require(process.env.GITHUB_WORKSPACE+'/.github/report-policy.cjs');
+            const {validateFast,assertIssue,selfTest:fastTests}=require(process.env.GITHUB_WORKSPACE+'/.github/fast-policy.cjs');
+            const policyChecks=selfTest(), fastChecks=fastTests();
+            const MARKER='<!-- meetnote-verify-report -->', ISSUE_MARKER='<!-- meetnote-live-contract-alert -->';
+            const {owner,repo}=context.repo;
+            const sha=context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+            const expectedRun={repository:owner+'/'+repo,sha:context.sha,run_id:String(context.runId),run_attempt:process.env.GITHUB_RUN_ATTEMPT,event_name:context.eventName};
+            const repoApi=process.env.GITHUB_API_URL+'/repos/'+owner+'/'+repo;
+            const runUrl=process.env.GITHUB_SERVER_URL+'/'+owner+'/'+repo+'/actions/runs/'+context.runId;
+            const liveExpected=process.env.LIVE_EXPECTED==='true',liveResult=process.env.LIVE_RESULT,isSchedule=context.eventName==='schedule';
+            const read=p=>{try{return fs.readFileSync(p,'utf8');}catch{return null;}};
+            const readJson=p=>{try{return JSON.parse(read(p));}catch{return null;}};
+            const fast=readJson('incoming/fast-report/fast.json'),live=readJson('incoming/live-report/live.json');
+            const fastProblems=validateFast(fast,expectedRun),liveCurrent=belongsToRun(live,expectedRun);
+            core.setOutput('live_state',liveCurrent?live.status:'invalid');
+            const fastLog=read('incoming/fast-report/fast.log')||read('incoming/fast-report/fast.stdout.log');
+            const identityLog=read('incoming/fast-report/identity.log'),liveLog=read('incoming/live-report/live.stdout.log');
             function canCloseAlert(r, job) {
               if (!belongsToRun(r, expectedRun)) return false;
               if (!r || typeof r !== 'object' || Array.isArray(r) || job !== 'success') return false;
@@ -256,161 +218,60 @@ jobs:
               const e = r.evidence;
               return Boolean(e && e.attempted_request === true && typeof e.response_id === 'string' && e.response_id.length && !e.response_id.startsWith('fixture-'));
             }
-            // These cases run before any remote side effect and use the production guard.
-            const checkIds = ['stub_channel_absent', 'contract_not_emptied', 'endpoint_is_real', 'transport_is_real', 'key_absent_from_repo', 'request_contract_accepted', 'envelope_is_json', 'envelope_matches_contract', 'response_is_not_a_recording', 'content_matches_schema', 'nonce_echoed_by_model', 'probe_yielded_extractions'];
-            const good = {run_identity: {...expectedRun}, status:'ok', exit_code:0, drift:[], unconfirmed_reasons:[], checks_run:12, checks_passed:12, checks:checkIds.map(id=>({id,ok:true})), evidence:{attempted_request:true,response_id:'live-selftest'}};
-            const cases = [[good,'success',true],[null,'success',false],[{...good,status:'unconfirmed'},'success',false],[{...good,status:'drift'},'success',false],[good,'failure',false],[{...good,checks:[],checks_run:0,checks_passed:0},'success',false],[{...good,checks_passed:11},'success',false],[{...good,exit_code:'0'},'success',false],[{...good,evidence:{attempted_request:false}},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:{...c,ok:'true'})},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:{id:'unrelated',ok:true})},'success',false],[{...good,unconfirmed_reasons:['blocked']},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:good.checks[1])},'success',false],[{...good,run_identity:null},'success',false],[{...good,run_identity:{...expectedRun,run_attempt:String(Number(expectedRun.run_attempt)+1)}},'success',false]];
-            for (const [r,j,w] of cases) if (canCloseAlert(r,j)!==w) throw new Error('recovery guard self-test failed');
-            core.info('Recovery guard self-tests: ' + cases.length + '/' + cases.length);
-
-            const L = [MARKER, '## meetnote verify', ''];
-            L.push('commit `' + sha.slice(0, 7) + '` | trigger `' + context.eventName + '` | ' + new Date().toISOString() + ' | [run](' + runUrl + ')');
-            L.push('execution `' + expectedRun.sha + '` | run `' + expectedRun.run_id + '` | attempt `' + expectedRun.run_attempt + '`');
-            L.push('report policy self-tests ' + policyChecks + '/' + policyChecks + ' | recovery self-tests ' + cases.length + '/' + cases.length);
-            L.push('fast job **' + process.env.FAST_RESULT + '** | live job **' + liveResult + '**');
-            L.push('');
-            if (identityLog) {
-              L.push('<details><summary>Run identity producer checks</summary>', '', '```', identityLog.split('\n').slice(-20).join('\n'), '```', '</details>', '');
+            const checkIds=['stub_channel_absent','contract_not_emptied','endpoint_is_real','transport_is_real','key_absent_from_repo','request_contract_accepted','envelope_is_json','envelope_matches_contract','response_is_not_a_recording','content_matches_schema','nonce_echoed_by_model','probe_yielded_extractions'];
+            const good={run_identity:{...expectedRun},status:'ok',exit_code:0,drift:[],unconfirmed_reasons:[],checks_run:12,checks_passed:12,checks:checkIds.map(id=>({id,ok:true})),evidence:{attempted_request:true,response_id:'live-selftest'}};
+            const cases=[[good,'success',true],[null,'success',false],[{...good,status:'unconfirmed'},'success',false],[{...good,status:'drift'},'success',false],[good,'failure',false],[{...good,checks:[],checks_run:0,checks_passed:0},'success',false],[{...good,checks_passed:11},'success',false],[{...good,exit_code:'0'},'success',false],[{...good,evidence:{attempted_request:false}},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:{...c,ok:'true'})},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:{id:'unrelated',ok:true})},'success',false],[{...good,unconfirmed_reasons:['blocked']},'success',false],[{...good,checks:good.checks.map((c,i)=>i?c:good.checks[1])},'success',false],[{...good,run_identity:null},'success',false],[{...good,run_identity:{...expectedRun,run_attempt:String(Number(expectedRun.run_attempt)+1)}},'success',false]];
+            for(const [r,j,w] of cases)if(canCloseAlert(r,j)!==w)throw Error('recovery guard self-test failed');
+            const L=[MARKER,'## meetnote verify','', 'commit `'+sha.slice(0,7)+'` | execution `'+context.sha+'` | run `'+context.runId+'` | attempt `'+expectedRun.run_attempt+'` | [run]('+runUrl+')',
+              'report policy '+policyChecks+'/'+policyChecks+' | fast/alert '+fastChecks+'/'+fastChecks+' | recovery '+cases.length+'/'+cases.length,
+              'fast job **'+process.env.FAST_RESULT+'** | live job **'+liveResult+'**',''];
+            if(fastProblems.length){L.push('### fast gate: 报告缺失、损坏或身份不符',...fastProblems.map(x=>'- '+x));}
+            else {L.push('### fast gate: `'+fast.status+'` '+fast.checks_passed+'/'+fast.checks_run+' (expected '+fast.expected_checks+')', '快报告运行身份、模块计数、失败计数已核对。'); for(const h of fast.hard_errors)L.push('- hard: '+h);for(const f of fast.failures)L.push('- '+f.test+'\n~~~\n'+f.summary+'\n~~~');}
+            if(identityLog)L.push('<details><summary>Producer identity tests</summary>','', '~~~',identityLog.slice(-5000),'~~~','</details>');
+            if(fastProblems.length&&fastLog)L.push('~~~',fastLog.slice(-5000),'~~~');
+            if(!liveExpected&&liveResult==='skipped')L.push('### live gate: 本轮按计划未运行，真实响应没有被验证。');
+            else if(!liveCurrent){L.push('### live gate: '+(!live?'报告缺失或 JSON 损坏':!consistentLive(live)?'报告结构、计数或状态矛盾':'报告运行身份不符'), '本轮真实响应没有被验证；不会修改告警状态。');if(liveLog)L.push('~~~',liveLog.slice(-5000),'~~~');}
+            else {const e=live.evidence;L.push('### live gate: `'+live.status+'` '+live.checks_passed+'/'+live.checks_run,
+              '真实请求 `'+e.attempted_request+'` | 尝试 `'+String(e.attempts??0)+'` | 响应 id `'+String(e.response_id??'not verified')+'`',
+              ...live.drift.map(d=>'- drift: '+d),...live.unconfirmed_reasons.map(u=>'- unconfirmed: '+u));
+              if(live.status==='unconfirmed')L.push('以上检查数不等于真实响应验证通过；本次恢复未确认。');}
+            if(isSchedule)L.push('心跳是否送达须独立读回 `.github/live-heartbeat.json`，不由事件类型推定。');
+            const body=L.join('\n');
+            async function upsertIssueComment(issueNumber){
+              const comments=await github.paginate(github.rest.issues.listComments,{owner,repo,issue_number:issueNumber,per_page:100});
+              const existing=selectOwned(comments,MARKER,c=>c.issue_url===repoApi+'/issues/'+issueNumber);
+              if(existing){await github.rest.issues.updateComment({owner,repo,comment_id:existing.id,body});return existing.id;}
+              return (await github.rest.issues.createComment({owner,repo,issue_number:issueNumber,body})).data.id;
             }
-
-            if (!fast) {
-              L.push('### fast gate: 报告没送到');
-              L.push('离线闸门没有产出报告，这一轮当作没跑。');
-              if (fastLog) { L.push(''); L.push('```'); L.push(fastLog.split('\n').slice(-25).join('\n')); L.push('```'); }
-            } else {
-              L.push('### fast gate: `' + fast.status + '` — ' + fast.checks_passed + '/' + fast.checks_run + ' 条通过（应为 ' + fast.expected_checks + ' 条，' + fast.duration_s + 's）');
-              for (const h of (fast.hard_errors || [])) { L.push('- **hard**: `' + h + '`'); }
-              const fails = fast.failures || [];
-              if (fails.length) {
-                L.push('');
-                L.push('<details><summary>失败明细 ' + fails.length + ' 条</summary>');
-                L.push('');
-                for (const f of fails.slice(0, 10)) {
-                  L.push('**' + f.test + '**');
-                  L.push('');
-                  L.push('```');
-                  L.push(f.summary);
-                  L.push('```');
-                }
-                L.push('</details>');
-              }
+            async function upsertCommitComment(){
+              const comments=await github.paginate(github.rest.repos.listCommentsForCommit,{owner,repo,commit_sha:sha,per_page:100});
+              const existing=selectOwned(comments,MARKER,c=>c.commit_id===sha);
+              if(existing){await github.rest.repos.updateCommitComment({owner,repo,comment_id:existing.id,body});return existing.id;}
+              return (await github.rest.repos.createCommitComment({owner,repo,commit_sha:sha,body})).data.id;
             }
-
-            L.push('');
-            if (!liveExpected && liveResult === 'skipped') {
-              // Saying nothing here would let a green comment read as if drift had
-              // been checked. It was not.
-              L.push('### live gate: 本轮没跑（分支推送不触发慢闸门）');
-              L.push('真实响应结构这一轮**没有被验证**。漂移检查跟 PR / 主干 / 每日定时走，不跟分支推送走。');
-            } else if (!liveCurrent) {
-              L.push('### live gate: 报告缺失或运行身份不匹配');
-              L.push('慢闸门报告不能证明属于本次执行，真实响应结构这一轮没有被验证；不会修改告警状态。');
-              if (liveLog) { L.push(''); L.push('```'); L.push(liveLog.split('\n').slice(-20).join('\n')); L.push('```'); }
-            } else {
-              const e = live.evidence || {};
-              L.push('### live gate: `' + live.status + '` — ' + live.checks_passed + '/' + live.checks_run + ' 条通过');
-              L.push('运行身份已核对：仓库、执行提交、run、attempt、事件均与本次上下文一致。');
-              L.push('- 打了真实请求: `' + String(e.attempted_request) + '` | 尝试 `' + String(e.attempts) + '` 次 | 耗时 `' + String(e.elapsed_ms) + 'ms`');
-              L.push('- 响应 id `' + String(e.response_id) + '`（已知录音 id ' + String(e.fixture_ids_known) + ' 个）| 抽取计数 `' + JSON.stringify(e.counts || null) + '`');
-              if (e.envelope_additions && e.envelope_additions.length) { L.push('- 新增字段（只报告，不判红）: `' + e.envelope_additions.join(', ') + '`'); }
-              for (const d of (live.drift || [])) { L.push('- **drift**: `' + d + '`'); }
-              for (const u of (live.unconfirmed_reasons || [])) { L.push('- unconfirmed: `' + u + '`'); }
-              const bad = (live.checks || []).filter((c) => !c.ok);
-              if (bad.length) {
-                L.push('');
-                L.push('<details><summary>未通过的检查 ' + bad.length + ' 条</summary>');
-                L.push('');
-                for (const c of bad) { L.push('- `' + c.id + '`: ' + c.detail); }
-                L.push('</details>');
-              }
-            }
-
-            if (isSchedule) {
-              L.push('');
-              L.push('本轮定时任务包含心跳写回步骤；是否送达须独立读回 `.github/live-heartbeat.json`，不由事件类型推定。');
-              if (!canCloseAlert(live, liveResult)) L.push('恢复未确认：不会因缺报告、未确认状态或矛盾结果关闭已有告警。');
-            }
-
-            const body = L.join('\n');
-
-            async function upsertIssueComment(issueNumber) {
-              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: issueNumber, per_page: 100 });
-              const existing = selectOwned(comments, MARKER, c => c.issue_url === repoApi + '/issues/' + issueNumber);
-              if (existing) {
-                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-                return existing.id;
-              }
-              const created = await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
-              return created.data.id;
-            }
-
-            async function upsertCommitComment() {
-              const comments = await github.paginate(github.rest.repos.listCommentsForCommit, { owner, repo, commit_sha: sha, per_page: 100 });
-              const existing = selectOwned(comments, MARKER, c => c.commit_id === sha);
-              if (existing) {
-                await github.rest.repos.updateCommitComment({ owner, repo, comment_id: existing.id, body });
-                return existing.id;
-              }
-              const created = await github.rest.repos.createCommitComment({ owner, repo, commit_sha: sha, body });
-              return created.data.id;
-            }
-
-            // ANTI-CLOBBER: one destination, one owner. Pushing to a branch with an
-            // open PR fires BOTH a push run and a pull_request run for the same
-            // commit. The push run skips the live gate, so if it also wrote to the
-            // marked PR comment it could land second and overwrite the full report
-            // with "live gate did not run". So the PR comment belongs to
-            // pull_request runs only; push and schedule runs own the commit comment.
+            // ANTI-CLOBBER: PR events alone own PR comments; push/schedule own commit comments.
             const issueNumber = context.payload.pull_request ? context.payload.pull_request.number : null;
-            // Resolve ambiguous alert targets before any write, not after comment delivery.
-            const issues = isSchedule ? await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'all', per_page: 100 }) : [];
-            const tracker = selectOwned(issues, ISSUE_MARKER, i => !i.pull_request && i.repository_url === repoApi);
-
-            let id = null;
-            let where = '';
-            if (issueNumber) {
-              id = await upsertIssueComment(issueNumber);
-              where = 'pr#' + issueNumber;
-            } else {
-              id = await upsertCommitComment();
-              where = 'commit ' + sha.slice(0, 7);
-            }
-            if (!id) { throw new Error('writeback produced no comment id'); }
-
-            const check = issueNumber
-              ? await github.rest.issues.getComment({ owner, repo, comment_id: id })
-              : await github.rest.repos.getCommitComment({ owner, repo, comment_id: id });
-            assertWritten(check.data, id, body, c => issueNumber ? c.issue_url === repoApi + '/issues/' + issueNumber : c.commit_id === sha);
-            core.info('report written to ' + where + ' comment ' + id);
-            if (liveExpected && !liveCurrent) core.setFailed('Live report missing or execution identity mismatch; alert state unchanged.');
-
-            // A scheduled run has no PR, and its commit comment lands on a main SHA
-            // that may not have moved in a week. Nobody reads that. So drift found
-            // by the clock is escalated to an issue, and the issue is closed again
-            // once the contract is back.
-            if (!isSchedule || !liveCurrent) { return; }
-            const drifted = live.status === 'drift';
-            const issueBody = [ISSUE_MARKER, '每日慢闸门的结论。这条 issue 由 CI 维护：漂移时打开，恢复后自动关闭。', '', body].join('\n');
-
-            if (drifted) {
-              const title = 'live contract drift: StepFun 响应结构和我们的契约不一致';
-              if (tracker) {
-                await github.rest.issues.update({ owner, repo, issue_number: tracker.number, title, body: issueBody, state: 'open' });
-                core.info('reopened drift issue #' + tracker.number);
-              } else {
-                const created = await github.rest.issues.create({ owner, repo, title, body: issueBody });
-                core.info('opened drift issue #' + created.data.number);
-              }
-            } else if (tracker && tracker.state === 'open' && canCloseAlert(live, liveResult)) {
-              await github.rest.issues.update({ owner, repo, issue_number: tracker.number, body: issueBody, state: 'closed' });
-              core.info('closed drift issue #' + tracker.number + ': the contract is back');
-            } else if (tracker && tracker.state === 'open') {
-              core.warning('Keeping alert #' + tracker.number + ' open: recovery is not verified.');
-            }
+            const issues=isSchedule?await github.paginate(github.rest.issues.listForRepo,{owner,repo,state:'all',per_page:100}):[];
+            const tracker=selectOwned(issues,ISSUE_MARKER,i=>!i.pull_request&&i.repository_url===repoApi);
+            const id=issueNumber?await upsertIssueComment(issueNumber):await upsertCommitComment();
+            if(!id)throw Error('no comment id');
+            const check=issueNumber?await github.rest.issues.getComment({owner,repo,comment_id:id}):await github.rest.repos.getCommitComment({owner,repo,comment_id:id});
+            assertWritten(check.data,id,body,c=>issueNumber?c.issue_url===repoApi+'/issues/'+issueNumber:c.commit_id===sha);
+            if(fastProblems.length||(liveExpected&&!liveCurrent))core.setFailed('Report validation failed; see precise reasons in the posted report.');
+            if(!isSchedule||!liveCurrent||fastProblems.length)return;
+            const issueBody=[ISSUE_MARKER,'Daily live contract result. Close only on verified current recovery.','',body].join('\n');
+            async function readIssue(number,state){const item=(await github.rest.issues.get({owner,repo,issue_number:number})).data;assertIssue(item,number,issueBody,state,repoApi);}
+            if(live.status==='drift'){
+              const title='live contract drift: StepFun response contract mismatch';
+              if(tracker){await github.rest.issues.update({ owner, repo, issue_number:tracker.number,title,body:issueBody,state: 'open' });await readIssue(tracker.number,'open');}
+              else {const created=await github.rest.issues.create({ owner, repo,title,body:issueBody });await readIssue(created.data.number,'open');}
+            }else if(tracker&&tracker.state==='open'&&canCloseAlert(live,liveResult)){
+              await github.rest.issues.update({ owner, repo,issue_number:tracker.number,body:issueBody,state: 'closed' });await readIssue(tracker.number,'closed');
+            }else if(tracker&&tracker.state==='open')core.warning('Keeping alert open: recovery not verified.');
       - name: confirm writeback reached a comment
         if: steps.writeback.outcome != 'success'
         run: |
-          echo "the report never reached a comment, so nobody can read this run. treating it as not run"
+          echo "report delivery or validation failed; see the current report if present"
           exit 1
       - name: verdict
         env:
@@ -419,33 +280,19 @@ jobs:
           fast="${{ needs.fast.result }}"
           live="${{ needs.live.result }}"
           expected="${{ steps.expect.outputs.live }}"
-          echo "fast=$fast live=$live live_expected=$expected event=${{ github.event_name }}"
-          if [ "$fast" != "success" ]; then
-            echo "fast gate did not pass"
-            exit 1
-          fi
+          if [ "$fast" != "success" ]; then exit 1; fi
           if [ "$expected" = "true" ]; then
-            if [ "$live" != "success" ]; then
-              echo "the live gate was supposed to run here and did not pass"
-              exit 1
-            fi
+            if [ "$live" != "success" ]; then exit 1; fi
             if [ "$LIVE_STATE" = "unconfirmed" ]; then
-              echo "execution completed; real response remains UNCONFIRMED, not a verified recovery"
+              echo "execution complete, real response UNCONFIRMED, not recovery"
               exit 0
             fi
-            if [ "$LIVE_STATE" != "ok" ]; then
-              echo "live report has no current successful or explicitly unconfirmed result"
-              exit 1
-            fi
-            echo "live report belongs to this execution and reports ok; recovery uses the stricter evidence guard"
+            if [ "$LIVE_STATE" != "ok" ]; then exit 1; fi
+            echo "current live report ok; recovery still requires positive evidence"
             exit 0
           fi
-          # A skip is only acceptable because we predicted it. Any other outcome
-          # means the job condition stopped matching the documented policy, and a
-          # drift detector that quietly stops running is the single failure that
-          # hides itself: everything stays green forever.
           if [ "$live" != "skipped" ]; then
-            echo "the live gate was expected to be skipped but reported '$live'; the trigger policy no longer matches the docs"
+            echo "trigger policy no longer matches the docs"
             exit 1
           fi
-          echo "live gate skipped on purpose (feature branch push). real response drift was NOT checked this round"
+          echo "live skipped on purpose; real response not verified"
